@@ -9,7 +9,7 @@
     "install-local": "deck-plugin install"
   },
   "devDependencies": {
-    "deck-plugin-sdk": "^0.15.1",
+    "deck-plugin-sdk": "^0.15.2",
     "@types/react": "^19.0.0",
     "lucide-react": "^1.0.0",
     "react": "^19.0.0",
