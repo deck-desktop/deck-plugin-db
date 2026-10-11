@@ -216,8 +216,8 @@ const ENGINES: { id: EngineId; label: string; hint: string }[] = [
 /**
  * The connection list, and the form for adding one.
  *
- * Connections live in `plugin-db`, which config.rs keeps device-local — so a password typed here
- * never reaches the vault or Syncthing. It IS stored in plain text on this machine, which is the
+ * Connections live in `plugin-db`, in Deck's config dir on this machine. A password typed here
+ * IS stored there in plain text, and a backup carries it whole, which is the
  * right trade for a local dev database and the wrong one for production; the note under the form
  * says so rather than leaving it to be discovered.
  */
