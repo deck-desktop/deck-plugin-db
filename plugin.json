@@ -3,6 +3,6 @@
   "name": "Databases",
   "description": "Browse SQLite files, Postgres and MySQL, and run queries against them.",
   "icon": "Database",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "minDeck": "0.9.0"
 }
