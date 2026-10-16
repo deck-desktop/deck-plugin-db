@@ -7,9 +7,10 @@
     "build": "deck-plugin build",
     "dev": "deck-plugin dev",
     "install-local": "deck-plugin install",
-    "check": "node db.check.mjs"
+    "test": "node db.check.mjs"
   },
   "devDependencies": {
+    "@tauri-apps/api": "^2.11.1",
     "@types/node": "^26.5.1",
     "@types/react": "^19.2.18",
     "@types/sql.js": "^1.4.11",
@@ -17,8 +18,9 @@
     "esbuild": "^0.28.2",
     "framer-motion": "^13.1.0",
     "lucide-react": "^1.31.0",
+    "monaco-editor": "^0.56.0",
     "react": "^19.2.8",
     "sql.js": "^1.14.2",
-    "typescript": "^5.8.3"
+    "typescript": "~5.8.3"
   }
 }
