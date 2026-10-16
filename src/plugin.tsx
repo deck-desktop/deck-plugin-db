@@ -80,7 +80,7 @@ export default function Database() {
     // config from before the save and write the new connection back out of existence.
     cfgRef.current = next;
     setCfg(next);
-    await configWrite(CFG, JSON.stringify(next)).catch(() => {});
+    await configWrite(CFG, JSON.stringify(next)).catch((e) => console.warn("[db] connections save failed", e));
   }, []);
 
   const connect = useCallback(async (conn: Connection) => {
@@ -127,7 +127,7 @@ export default function Database() {
       // that is no longer reachable surfaces as an error on the connection list, not a hang.
       const last = saved.connections.find((c) => c.id === saved.lastId);
       if (last) void connect(last);
-    }).catch(() => {});
+    }).catch((e) => console.warn("[db] connections load failed", e));
     // Once, on mount: `connect` is stable and re-running this would reconnect on every save.
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -235,7 +235,7 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
   const engine = ENGINES.find((e) => e.id === draft?.engine) ?? ENGINES[0];
 
   const browse = async () => {
-    const p = await pickFile("db").catch(() => "");
+    const p = await pickFile("db").catch((e) => { console.warn("[db] file picker failed", e); return ""; });
     if (p && draft) setDraft({ ...draft, target: p, name: draft.name || fileName(p) });
   };
 
@@ -1123,7 +1123,7 @@ function Results({
   const download = async (r: Result) => {
     // The rows EXPORTED are the rows on screen, which is what the cap makes them. Writing the
     // full result instead would silently disagree with the count shown above the grid.
-    const path = await pickSavePath("query.csv", "csv").catch(() => "");
+    const path = await pickSavePath("query.csv", "csv").catch((e) => { console.warn("[db] save dialog failed", e); return ""; });
     if (!path) return;
     try {
       await fsWrite(path, toCsv(r));
