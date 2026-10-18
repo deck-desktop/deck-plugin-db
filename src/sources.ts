@@ -1,23 +1,25 @@
-// The one implementation of `Source`, over Deck's db_* commands.
+// The one implementation of `Source`, over Deck's db_* commands or the helper program that
+// answers them the same way for SQL Server, Redis and MongoDB (helper.ts).
 //
 // Kept out of db.ts so that file stays pure — it is compiled and imported by db.check.mjs, which
 // runs in node with no Deck around it. Everything here reaches for Deck's bridge, which does not
 // exist in that harness.
 //
 // Every engine is opened the same way, by a url whose scheme picks it (`sqlite:<path>`,
-// postgres://, mysql://, mssql://, redis://, mongodb://), and the connection
-// lives in Rust. A file is opened in place, not copied: with writes allowed, a write reaches the
-// file itself.
+// postgres://, mysql://, mssql://, redis://, mongodb://), and the connection lives in Rust: in
+// Deck, or in the helper. A file is opened in place, not copied: with writes allowed, a write
+// reaches the file itself.
 import {
   dbConnect, dbDisconnect, dbQuery, dbSchema, sshTunnelClose, sshTunnelOpen,
 } from "../shim/bridge.js";
+import { helperDb, usesHelper } from "./helper";
 import {
   connectUrl, countFor, isFile, throughTunnel,
   type Connection, type EngineId, type Source,
 } from "./db";
 
 /**
- * Any engine, over the Rust commands.
+ * Any engine, over Deck's commands or the helper's.
  *
  * The connection lives in Rust and survives this module unmounting, which Deck does on every
  * navigation — so `close` is called when the connection is closed by the user, not when the
@@ -40,9 +42,12 @@ export async function openNative(
     target = throughTunnel(url, port);
   }
 
+  const db = usesHelper(engine)
+    ? helperDb
+    : { connect: dbConnect, query: dbQuery, schema: dbSchema, disconnect: dbDisconnect };
   let handle: number;
   try {
-    handle = await dbConnect(target);
+    handle = await db.connect(target);
   } catch (e) {
     // A tunnel left open after a failed connect would hold an ssh process for a connection that
     // does not exist, and the next attempt would open another.
@@ -53,7 +58,7 @@ export async function openNative(
   return {
     engine,
     async schema() {
-      const s = await dbSchema(handle);
+      const s = await db.schema(handle);
       return {
         tables: s.tables.map((t) => ({
           name: t.name,
@@ -70,9 +75,9 @@ export async function openNative(
     },
     async run(sql, allowWrites, skip = 0) {
       // read_only is the inverse, and it is the DATABASE's guarantee rather than the UI's: with
-      // it on, the engine itself (or, for Redis and MongoDB, Rust's list of read commands)
+      // it on, the engine itself (or, for Redis and MongoDB, the helper's list of read commands)
       // refuses a write, whatever form the statement takes.
-      const r = await dbQuery(handle, sql, !allowWrites, skip);
+      const r = await db.query(handle, sql, !allowWrites, skip);
       return {
         columns: r.columns,
         rows: r.rows,
@@ -83,13 +88,13 @@ export async function openNative(
     async rowCount(table) {
       const q = countFor(engine, table);
       if (!q) throw new Error(`${engine} has no row count for ${table}`);
-      const r = await dbQuery(handle, q, true);
+      const r = await db.query(handle, q, true);
       // MongoDB's count replies { n, ok }; a SQL count is its one cell.
       const n = r.columns.indexOf("n");
       return Number(r.rows[0]?.[n >= 0 ? n : 0] ?? 0);
     },
     async close() {
-      await dbDisconnect(handle);
+      await db.disconnect(handle);
       if (tunnel !== null) await sshTunnelClose(tunnel).catch(() => {});
     },
   };

@@ -3,7 +3,8 @@
 //
 // Every engine goes through Deck's own db_* commands, which hold the connection in Rust: a
 // webview has no way to open a TCP socket, and a database file is better opened in place than
-// read into memory. So a file is the real file, and a write to it, with writes allowed, is a
+// read into memory. SQL Server, Redis and MongoDB go through a helper program that answers the
+// same calls (src/helper.ts), downloaded the first time one of them is opened. So a file is the real file, and a write to it, with writes allowed, is a
 // write to the file.
 //
 // The difference stops at `Source` (src/sources.ts) and the per-engine functions in db.ts.
@@ -13,7 +14,7 @@
 //
 // READ-ONLY BY DEFAULT, per connection, and the database's own guarantee: Rust opens the file
 // read-only or sets the session flag, so the ENGINE refuses a write rather than a regex here
-// doing it (Redis and MongoDB, which have no such flag, by Rust's list of read commands).
+// doing it (Redis and MongoDB, which have no such flag, by the helper's list of read commands).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Database as DatabaseIcon, Play, FolderOpen, RefreshCw, Table2, Eye, Download, KeyRound, X,
@@ -36,6 +37,7 @@ import {
   type QueryTab, type Result, type SchemaTable, type Source,
 } from "./db";
 import { open } from "./sources";
+import { HELPER, helperInstalled, installHelper, stopHelper, usesHelper } from "./helper";
 import { Diagram } from "./Diagram";
 import { Structure } from "./Structure";
 
@@ -112,7 +114,7 @@ const lastRuns = new Map<string, TabRun>();
 
 export default function Database() {
   const [cfg, setCfg] = useState<Saved>(DEFAULTS);
-  const [confirmRemove, setConfirmRemove] = useState<ConfirmState | null>(null);
+  const [confirm, setConfirm] = useState<ConfirmState | null>(null);
   const [source, setSource] = useState<Source | null>(null);
   const [active, setActive] = useState<Connection | null>(null);
   const [schema, setSchema] = useState<SchemaTable[]>([]);
@@ -153,8 +155,30 @@ export default function Database() {
     });
   }, []);
 
-  const connect = useCallback(async (conn: Connection) => {
+  const connect = useCallback(async (conn: Connection): Promise<void> => {
     if (!conn.target) return;
+    if (usesHelper(conn.engine) && !(await helperInstalled().catch(() => false))) {
+      // Asked, not done: it downloads a program and runs it.
+      setConfirm({
+        title: `Install the drivers for ${engineLabel(conn.engine)}?`,
+        body: <>
+          SQL Server, Redis and MongoDB are opened by a small helper program, downloaded once
+          ({HELPER.size}) from this plugin's releases on GitHub and checked against its SHA-256
+          before it runs.
+        </>,
+        confirmLabel: "Install",
+        danger: false,
+        onConfirm: () => {
+          setBusy(true);
+          setError("");
+          void installHelper().then(
+            () => { toast("Database drivers installed"); return connect(conn); },
+            (e) => { setError(String(e)); setBusy(false); },
+          );
+        },
+      });
+      return;
+    }
     setBusy(true);
     setError("");
     try {
@@ -216,7 +240,7 @@ export default function Database() {
 
   const remove = (id: string) => {
     const c = cfgRef.current.connections.find((x) => x.id === id);
-    setConfirmRemove({
+    setConfirm({
       title: `Remove ${c ? defaultName(c) : "this connection"}?`,
       body: "Its saved details go, passwords included. The database itself is not touched.",
       confirmLabel: "Remove",
@@ -233,7 +257,7 @@ export default function Database() {
         <Connections list={cfg.connections} error={error} busy={busy}
           onConnect={(c) => void connect(c)}
           onSave={upsert} onDelete={remove} />
-        <ConfirmDialog state={confirmRemove} onClose={() => setConfirmRemove(null)} />
+        <ConfirmDialog state={confirm} onClose={() => setConfirm(null)} />
       </>
     );
   }
@@ -297,20 +321,17 @@ function blank(engine: EngineId): Connection {
  * server's usual one, the default for an SSH tunnel's far end; `ask` is what the editor takes,
  * said in the empty results pane.
  */
-// `later`: written for, but not yet offered. Their drivers are moving out of Deck into a helper the
-// plugin downloads on first use, so until that exists Deck cannot open them; the rest of the plugin
-// already handles them, and a connection saved to one still shows by its name.
-const ENGINES: { id: EngineId; label: string; hint: string; ext?: string; port?: number; ask: string; later?: boolean }[] = [
+const ENGINES: { id: EngineId; label: string; hint: string; ext?: string; port?: number; ask: string }[] = [
   { id: "sqlite", label: "SQLite", hint: "A .db, .sqlite or .sqlite3 file", ext: "db", ask: "write a query above" },
   { id: "postgres", label: "Postgres", hint: "postgres://user:password@host:5432/database", port: 5432, ask: "write a query above" },
   { id: "mysql", label: "MySQL", hint: "mysql://user:password@host:3306/database", port: 3306, ask: "write a query above" },
   {
-    id: "mssql", label: "SQL Server", port: 1433, ask: "write a query above", later: true,
+    id: "mssql", label: "SQL Server", port: 1433, ask: "write a query above",
     hint: "mssql://user:password@host:1433/database?trustServerCertificate=true",
   },
-  { id: "redis", label: "Redis", hint: "redis://host:6379/0", port: 6379, later: true, ask: "type a command above, such as GET user:1 or HGETALL user:1" },
+  { id: "redis", label: "Redis", hint: "redis://host:6379/0", port: 6379, ask: "type a command above, such as GET user:1 or HGETALL user:1" },
   {
-    id: "mongo", label: "MongoDB", hint: "mongodb://user:password@host:27017/database", port: 27017, later: true,
+    id: "mongo", label: "MongoDB", hint: "mongodb://user:password@host:27017/database", port: 27017,
     ask: `type a command above as JSON, such as {"find": "users", "filter": {}}`,
   },
 ];
@@ -425,7 +446,7 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
           style={{ background: "var(--bg-card-glass)" }}>
           {/* The engine, as one group of buttons with the chosen one selected. */}
           <div className="mb-3 inline-flex flex-wrap items-center gap-0.5 rounded-lg border border-subtle bg-elev p-0.5">
-            {ENGINES.filter((e) => !e.later).map((e) => (
+            {ENGINES.map((e) => (
               <button key={e.id} onClick={() => setDraft({ ...draft, engine: e.id, target: "" })}
                 aria-pressed={draft.engine === e.id}
                 className={`h-6 rounded-md px-2.5 text-[12px] transition-colors ${
@@ -2057,4 +2078,9 @@ Double-click to edit` : text}
       </div>
     </div>
   );
+}
+
+/** Called by Deck before a reload re-imports this plugin: the old copy's helper program goes with it. */
+export function dispose() {
+  stopHelper();
 }

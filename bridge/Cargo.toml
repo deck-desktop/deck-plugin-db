@@ -1,0 +1,35 @@
+[package]
+name = "deck-db-bridge"
+version = "1.0.0"
+edition = "2021"
+description = "SQL Server, Redis and MongoDB for Deck's database plugin, spoken to as JSON lines on stdin and stdout"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+chrono = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "time", "sync"] }
+# SQL Server (mssql.rs). TLS through native-tls, which on Windows is the system's own SChannel:
+# tiberius's `rustls` feature turns on tokio-rustls's defaults, which build aws-lc (a C build
+# needing cmake and NASM) and put a second crypto provider beside mongodb's ring, after which any
+# rustls config built without naming its provider panics. Without the default `winauth`, so SQL
+# logins only. `chrono` decodes the date types; `tds73` is the protocol every server since 2008
+# speaks.
+tiberius = { version = "0.13", default-features = false, features = ["tds73", "native-tls", "chrono"] }
+# tiberius wants a futures-io stream; compat adapts tokio's TcpStream to one.
+tokio-util = { version = "0.7", features = ["compat"] }
+# Redis (redis_kv.rs). ConnectionManager is one multiplexed connection that reconnects by itself,
+# built once per handle.
+redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager"] }
+# MongoDB (mongo.rs). Its defaults are rustls on ring and DNS SRV lookups, which mongodb+srv://
+# needs.
+mongodb = "3"
+# Parsing mssql:// urls.
+url = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
