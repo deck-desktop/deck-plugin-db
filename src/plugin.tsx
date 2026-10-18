@@ -16,11 +16,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Database as DatabaseIcon, Play, FolderOpen, RefreshCw, Table2, Eye, Download, KeyRound, X,
   History, ArrowUp, ArrowDown, Link2, Code2, TextSelect, Plus, Pencil, Trash2, Plug,
-  ChevronRight, Search, Hash, Columns3, Copy,
+  ChevronRight, Search, Hash, Columns3, Copy, Network,
 } from "lucide-react";
 import { configRead, configWrite, fsWrite, pickFile, pickSavePath } from "../shim/bridge.js";
 import {
-  ConfirmDialog, ContextMenu, Field, TextInput, toast, useResize,
+  ConfirmDialog, ContextMenu, Field, TextInput, Toggle, toast, useResize,
   type ConfirmState, type MenuEntry,
 } from "../shim/ui.js";
 import { monaco } from "../shim/monaco.js";
@@ -32,8 +32,25 @@ import {
   type Result, type SchemaTable, type Source,
 } from "./db";
 import { open } from "./sources";
+import { Diagram } from "./Diagram";
 
 const CFG = "plugin-db";
+
+// Deck's design guide (docs/design.md), as the classes this plugin repeats.
+/** An icon button inside a row: one step stronger on hover so it shows against the row's own. */
+const iconBtn = "grid size-5 shrink-0 place-items-center rounded text-text-muted transition-colors hover:bg-white/10 hover:text-text-primary";
+const dangerBtn = "grid size-5 shrink-0 place-items-center rounded text-text-muted transition-colors hover:bg-white/10 hover:text-red-400";
+/** The one accent-filled action on a screen; give it `style={accentFill}`. */
+const primaryBtn = "flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-3 text-[12.5px] font-medium text-white transition hover:brightness-110 disabled:opacity-50 disabled:hover:brightness-100";
+const accentFill = { background: "var(--accent)" };
+const secondaryBtn = "flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-subtle bg-elev px-3 text-[12.5px] text-text-secondary transition-colors hover:border-strong hover:text-text-primary disabled:opacity-50 disabled:hover:border-subtle";
+/** A smaller secondary, for a result's header. */
+const smallBtn = "flex h-6 shrink-0 items-center gap-1 rounded-md border border-subtle bg-elev px-1.5 text-[11px] text-text-secondary transition-colors hover:border-strong hover:text-text-primary disabled:opacity-40 disabled:hover:border-subtle";
+/** A state in its colour: the text in it, the background the same at 14%. */
+const chip = (color: string) => ({ color, background: `color-mix(in srgb, ${color} 14%, transparent)` });
+const chipCls = "shrink-0 rounded-full px-1.5 py-px text-[10.5px]";
+/** A secondary button sized for the query toolbar. */
+const toolBtn = "flex h-7 shrink-0 items-center gap-1.5 rounded-lg border border-subtle bg-elev px-2.5 text-[12px] text-text-secondary transition-colors hover:border-strong hover:text-text-primary disabled:opacity-40 disabled:hover:border-subtle";
 
 interface Saved {
   /** Every saved connection. Device-local: config.rs keeps `plugin-` files off the vault. */
@@ -56,6 +73,7 @@ const DEFAULTS: Saved = { connections: [], lastId: "", sql: "", history: [] };
 
 export default function Database() {
   const [cfg, setCfg] = useState<Saved>(DEFAULTS);
+  const [confirmRemove, setConfirmRemove] = useState<ConfirmState | null>(null);
   const [source, setSource] = useState<Source | null>(null);
   const [active, setActive] = useState<Connection | null>(null);
   const [schema, setSchema] = useState<SchemaTable[]>([]);
@@ -139,17 +157,26 @@ export default function Database() {
   };
 
   const remove = (id: string) => {
-    void save({
-      ...cfgRef.current,
-      connections: cfgRef.current.connections.filter((c) => c.id !== id),
+    const c = cfgRef.current.connections.find((x) => x.id === id);
+    setConfirmRemove({
+      title: `Remove ${c ? defaultName(c) : "this connection"}?`,
+      body: "Its saved details go, passwords included. The database itself is not touched.",
+      confirmLabel: "Remove",
+      onConfirm: () => void save({
+        ...cfgRef.current,
+        connections: cfgRef.current.connections.filter((x) => x.id !== id),
+      }),
     });
   };
 
   if (!source || !active) {
     return (
-      <Connections list={cfg.connections} error={error} busy={busy}
-        onConnect={(c) => void connect(c)}
-        onSave={upsert} onDelete={remove} />
+      <>
+        <Connections list={cfg.connections} error={error} busy={busy}
+          onConnect={(c) => void connect(c)}
+          onSave={upsert} onDelete={remove} />
+        <ConfirmDialog state={confirmRemove} onClose={() => setConfirmRemove(null)} />
+      </>
     );
   }
 
@@ -259,8 +286,8 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
     <div className="flex min-h-0 flex-1 flex-col overflow-auto">
       <div className="mx-auto w-full max-w-3xl shrink-0 p-8">
       <div className="mb-4">
-        <h2 className="text-lg font-semibold text-text-primary">Databases</h2>
-        <p className="text-[13px] text-text-muted">
+        <h2 className="text-[20px] font-semibold text-text-primary">Databases</h2>
+        <p className="text-[12.5px] text-text-muted">
           {list.length === 0
             ? "No connections yet"
             : `${list.length} connection${list.length === 1 ? "" : "s"}`}
@@ -270,64 +297,67 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
       {/* One card of divided rows, matching Script Runner: the same shape for the same job means
           a list of saved things reads the same everywhere in Deck. */}
       {list.length > 0 && (
-        <div className="divide-y divide-subtle overflow-hidden rounded-xl border border-subtle"
+        <div className="divide-y divide-subtle overflow-hidden rounded-lg border border-subtle"
           style={{ background: "var(--bg-card-glass)" }}>
           {list.map((c) => (
-            <div key={c.id} className="group flex items-center gap-3 px-4 py-2.5 transition-colors">
+            <div key={c.id} className="group flex items-center gap-3 px-3.5 py-2 transition-colors hover:bg-white/5">
               {/* A dot for engine and state, the way a script's dot shows enabled. */}
               {/* The dot becomes a spinner on the one being opened: with several connections a
                   single "Connecting…" line does not say WHICH, and over a tunnel that wait is
                   long enough for the question to come up. */}
               {busy && pending === c.id ? (
-                <RefreshCw size={11} className="shrink-0 animate-spin text-accent" />
+                <RefreshCw size={11} className="shrink-0 animate-spin text-text-secondary" />
               ) : (
-                <span className="h-2.5 w-2.5 shrink-0 rounded-full"
+                // A tone rather than the accent, which marks only what is selected.
+                <span className="size-[7px] shrink-0 rounded-full"
                   title={ENGINES.find((e) => e.id === c.engine)?.label ?? c.engine}
-                  style={{ background: c.engine === "sqlite" ? "var(--border-strong)" : "var(--accent)" }} />
+                  style={{ background: c.engine === "sqlite" ? "var(--text-muted)" : "rgb(var(--tone-sky-400))" }} />
               )}
               <button onClick={() => { setPending(c.id); onConnect(c); }} disabled={busy}
                 className="min-w-0 flex-1 text-left disabled:opacity-50">
                 <div className="flex items-center gap-1.5">
-                  <span className="truncate text-sm font-medium text-text-primary">{c.name}</span>
-                  <span className="shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide"
-                    style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
-                    {c.engine === "postgres" ? "PG" : c.engine === "mysql" ? "MySQL" : "SQLite"}
+                  <span className="truncate text-[12.5px] font-medium text-text-primary">{c.name}</span>
+                  <span className={chipCls + " text-text-secondary"} style={{ background: "var(--bg-elev)" }}>
+                    {c.engine === "postgres" ? "Postgres" : c.engine === "mysql" ? "MySQL" : "SQLite"}
                   </span>
                   {c.sshHost && (
-                    <span className="shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-text-muted ring-1 ring-subtle"
-                      title={`through ssh ${c.sshHost}`}>ssh</span>
+                    <span className={chipCls + " text-text-muted"} style={{ background: "var(--bg-elev)" }}
+                      title={`through ssh ${c.sshHost}`}>SSH</span>
                   )}
                   {c.allowWrites && (
-                    <span className="shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-amber-400 ring-1 ring-amber-400/40"
-                      title="Writes are allowed on this connection">writes</span>
+                    <span className={chipCls} style={chip("rgb(var(--tone-amber-400))")}
+                      title="Writes are allowed on this connection">Writes</span>
                   )}
                 </div>
                 <div className="truncate text-[11px] text-text-muted">{redact(c.target)}</div>
               </button>
-              <button onClick={() => setDraft(c)} title="Edit"
-                className="shrink-0 rounded-md p-1.5 text-text-muted opacity-0 transition hover:bg-white/5 hover:text-text-primary group-hover:opacity-100">
-                <Pencil size={13} />
-              </button>
-              <button onClick={() => onDelete(c.id)} title="Remove"
-                className="shrink-0 rounded-md p-1.5 text-text-muted opacity-0 transition hover:bg-white/5 hover:text-red-400 group-hover:opacity-100">
-                <Trash2 size={13} />
-              </button>
+              <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                <button onClick={() => setDraft(c)} title="Edit" className={iconBtn}>
+                  <Pencil size={13} />
+                </button>
+                <button onClick={() => onDelete(c.id)} title="Remove" className={dangerBtn}>
+                  <Trash2 size={13} />
+                </button>
+              </div>
             </div>
           ))}
         </div>
       )}
 
       {draft ? (
-        <div className="mt-3 rounded-xl border border-subtle p-4"
+        <div className="mt-3 rounded-lg border border-subtle p-4"
           style={{ background: "var(--bg-card-glass)" }}>
-          <div className="mb-3 flex gap-1.5">
+          {/* The engine, as one group of buttons with the chosen one selected. */}
+          <div className="mb-3 inline-flex items-center gap-0.5 rounded-lg border border-subtle bg-elev p-0.5">
             {ENGINES.map((e) => (
               <button key={e.id} onClick={() => setDraft({ ...draft, engine: e.id, target: "" })}
-                className={`rounded-md border px-2.5 py-1 text-[12px] transition ${
+                aria-pressed={draft.engine === e.id}
+                className={`h-6 rounded-md px-2.5 text-[12px] transition-colors ${
                   draft.engine === e.id
-                    ? "border-accent-soft bg-white/10"
-                    : "border-subtle text-text-muted hover:text-text-secondary"
-                }`}>
+                    ? "text-text-primary"
+                    : "text-text-muted hover:bg-white/5 hover:text-text-primary"
+                }`}
+                style={draft.engine === e.id ? { background: "var(--accent-soft)" } : undefined}>
                 {e.label}
               </button>
             ))}
@@ -348,8 +378,8 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
                   placeholder={engine.hint} />
                 {draft.engine === "sqlite" && (
                   <button onClick={browse}
-                    className="flex shrink-0 items-center gap-2 rounded-lg border border-subtle bg-elev px-3 text-sm hover:border-accent-soft">
-                    <FolderOpen size={15} /> Browse
+                    className="flex shrink-0 items-center gap-1.5 rounded-lg border border-subtle bg-elev px-3 text-[12.5px] text-text-secondary transition-colors hover:border-strong hover:text-text-primary">
+                    <FolderOpen size={14} /> Browse
                   </button>
                 )}
               </div>
@@ -357,15 +387,15 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
           </div>
 
           {draft.engine !== "sqlite" && (
-            <div className="mt-3 rounded-md border border-subtle/60 p-3">
-              <label className="flex cursor-pointer items-center gap-2 text-[12px]">
+            <div className="mt-3 rounded-lg border border-subtle p-3">
+              <label className="flex cursor-pointer items-center gap-2 text-[12.5px] text-text-secondary">
                 <input type="checkbox" checked={!!draft.sshHost}
                   onChange={(ev) => setDraft({
                     ...draft,
                     sshHost: ev.target.checked ? "vps" : "",
                     sshRemote: ev.target.checked ? (draft.sshRemote || "localhost:5432") : "",
                   })}
-                  className="accent-accent" />
+                  className="accent-[var(--accent)]" />
                 <Plug size={12} className="text-text-muted" />
                 Connect through an SSH tunnel
               </label>
@@ -384,7 +414,7 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
                       onChange={(ev) => setDraft({ ...draft, sshRemote: ev.target.value })}
                       placeholder="localhost:5432" />
                   </Field>
-                  <p className="text-[11px] text-text-muted">
+                  <p className="text-[11.5px] text-text-muted">
                     Write the url below as if you were on that host; Deck points it at the tunnel.
                   </p>
                 </div>
@@ -393,7 +423,7 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
           )}
 
           {draft.engine !== "sqlite" && (
-            <p className="mt-2 text-[11px] text-text-muted">
+            <p className="mt-2 text-[11.5px] leading-relaxed text-text-muted">
               The url is saved on this machine only — never synced, never in the vault — but it is
               stored as plain text, password included. Fine for a local or development database;
               for anything production, connect with an account that can only read.
@@ -401,25 +431,33 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
           )}
 
           <div className="mt-4 flex gap-2">
-            <button onClick={commit} disabled={!draft.target.trim()}
-              className="flex items-center gap-2 rounded-lg border border-subtle bg-elev px-3 py-2 text-sm hover:border-accent-soft disabled:opacity-50">
-              <Plug size={15} /> Save and connect
+            <button onClick={commit} disabled={!draft.target.trim()} className={primaryBtn} style={accentFill}>
+              <Plug size={14} /> Save and connect
             </button>
-            <button onClick={() => setDraft(null)}
-              className="rounded-lg border border-subtle px-3 py-2 text-sm text-text-muted hover:text-text-primary">
+            <button onClick={() => setDraft(null)} className={secondaryBtn}>
               Cancel
             </button>
           </div>
         </div>
+      ) : list.length === 0 ? (
+        // Nothing saved yet: what this is for, and the way in.
+        <div className="flex items-start gap-2.5 rounded-lg border border-subtle bg-elev px-3 py-3 text-[12.5px] leading-relaxed text-text-muted">
+          <DatabaseIcon size={16} className="mt-0.5 shrink-0" />
+          <div className="flex flex-col items-start gap-2.5">
+            <span>Open a SQLite file, or connect to a Postgres or MySQL server, to browse its tables and run queries. A connection is read-only until you allow writes.</span>
+            <button onClick={() => setDraft(blank("sqlite"))} className={primaryBtn} style={accentFill}>
+              <Plus size={14} /> Add a connection
+            </button>
+          </div>
+        </div>
       ) : (
-        <button onClick={() => setDraft(blank("sqlite"))}
-          className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-subtle py-2.5 text-sm text-text-muted transition hover:border-accent hover:text-text-primary">
-          <Plus size={16} /> Add a connection
+        <button onClick={() => setDraft(blank("sqlite"))} className={secondaryBtn + " mt-3"}>
+          <Plus size={14} /> Add a connection
         </button>
       )}
 
         {busy && (
-          <p className="mt-4 flex items-center gap-2 text-[13px] text-text-muted">
+          <p className="mt-4 flex items-center gap-2 text-[12.5px] text-text-muted">
             <RefreshCw size={13} className="animate-spin" />
             {/* A tunnel is the slow part, so name it rather than leaving a generic wait. */}
             {list.find((c) => c.id === pending)?.sshHost
@@ -427,7 +465,7 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
               : "Connecting…"}
           </p>
         )}
-        {error && <p className="mt-4 whitespace-pre-wrap text-[13px] text-red-400">{error}</p>}
+        {error && <p className="mt-4 whitespace-pre-wrap text-[12.5px] text-red-400">{error}</p>}
       </div>
     </div>
   );
@@ -476,7 +514,8 @@ function Browser({
   const [results, setResults] = useState<Result[]>([]);
   const [error, setError] = useState("");
   const [ran, setRan] = useState(0);
-  const [showHistory, setShowHistory] = useState(false);
+  // Where the history menu opens, under its button; null while it is closed.
+  const [historyAt, setHistoryAt] = useState<{ x: number; y: number } | null>(null);
   // The table the CURRENT result came from, which is what an edit writes to.
   const [ranTable, setRanTable] = useState<string | null>(null);
   /**
@@ -488,6 +527,9 @@ function Browser({
    * "still working, 3.4s" is the thing worth saying and a bare spinner does not say it.
    */
   const [running, setRunning] = useState<number | null>(null);
+  // How long the last run took, shown beside its row count.
+  const [took, setTook] = useState<number | null>(null);
+  const [view, setView] = useState<"query" | "diagram">("query");
   // The editor owns the text; this mirrors it so the run button and Ctrl+Enter see the same SQL.
   const sql = useRef(initialSql);
   // What the editor would run right now — the selection if there is one. Set by the Editor, read
@@ -537,7 +579,8 @@ function Browser({
       return;
     }
     setError("");
-    setRunning(Date.now());
+    const started = Date.now();
+    setRunning(started);
     // Which table these rows came from, decided by the SQL that is about to run. The sidebar
     // selection cannot answer it: a typed query sets no selection, and an old one would name a
     // table the user is not looking at — which would send an edit to the wrong place.
@@ -548,6 +591,7 @@ function Browser({
       // One at a time also matters for the servers: Postgres refuses several per round trip.
       for (const s of statements) out.push(await source.run(s, allowWrites));
       setResults(out);
+      setTook(Date.now() - started);
       // Recorded only once it RAN. A query that was blocked or threw is not one to offer back.
       onPersist({
         sql: sql.current,
@@ -634,47 +678,59 @@ ${String(e)}`);
           of table names is not, and it gives the sticky column headers (`bg-app/95`) something
           real to be opaque against. The schema pane keeps Deck's glass. */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-app">
-        <div className="flex shrink-0 items-center gap-2 border-b border-subtle px-3 py-2">
+        {/* Which database this is, and what may be done to it. */}
+        <div className="flex shrink-0 items-center gap-2 px-3 pb-1 pt-2">
           <DatabaseIcon size={14} className="shrink-0 text-text-muted" />
-          <span className="truncate text-[12px] text-text-secondary" title={conn.target}>
+          <span className="shrink-0 truncate text-[13px] font-semibold text-text-primary" title={conn.target}>
             {conn.name}
           </span>
+          <span className={chipCls + " text-text-secondary"} style={{ background: "var(--bg-elev)" }}>
+            {ENGINES.find((e) => e.id === engine)?.label ?? engine}
+          </span>
+          <span className="min-w-0 truncate text-[11px] text-text-muted" title={conn.target}>{redact(conn.target)}</span>
 
-          <label className="ml-auto flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px] text-text-muted"
+          {/* The query and its results, or the whole schema drawn as a diagram. */}
+          <div className="ml-auto flex shrink-0 items-center gap-0.5 rounded-lg border border-subtle bg-elev p-0.5">
+            {([["query", "Query", Code2], ["diagram", "Diagram", Network]] as const).map(([id, label, Icon]) => (
+              <button key={id} onClick={() => setView(id)} aria-pressed={view === id}
+                className={"flex h-6 items-center gap-1.5 rounded-md px-2 text-[12px] transition-colors " + (view === id ? "text-text-primary" : "text-text-muted hover:text-text-primary")}
+                style={view === id ? { background: "var(--accent-soft)", boxShadow: "inset 0 0 0 1px var(--accent)" } : undefined}>
+                <Icon size={12} />{label}
+              </button>
+            ))}
+          </div>
+
+          <label className="ml-2 flex shrink-0 cursor-pointer items-center gap-2 text-[12px] text-text-secondary"
             title={engine === "sqlite"
               ? "Writes apply to the in-memory copy only and are never saved to the file."
               : "Writes reach the real database. Off means the server itself refuses them."}>
-            <input type="checkbox" checked={allowWrites}
-              onChange={(e) => onToggleWrites(e.target.checked)} className="accent-accent" />
             Allow writes
+            <Toggle on={allowWrites} onChange={onToggleWrites} />
           </label>
 
-          <button onClick={onReopen} disabled={busy} title="Reload the file from disk"
-            className="flex shrink-0 items-center gap-1 rounded-md border border-subtle bg-elev px-2 py-1 text-[12px] hover:border-accent-soft disabled:opacity-50">
+          <button onClick={onReopen} disabled={busy} title="Reload the file from disk" className={toolBtn}>
             <RefreshCw size={12} className={busy ? "animate-spin" : ""} /> Reload
           </button>
           <button onClick={onClose} title="Close this database"
-            className="flex shrink-0 items-center gap-1 rounded-md border border-subtle bg-elev px-2 py-1 text-[12px] text-text-muted hover:text-text-primary">
-            <X size={12} />
+            className="grid size-7 shrink-0 place-items-center rounded-lg text-text-muted transition-colors hover:bg-white/5 hover:text-text-primary">
+            <X size={14} />
           </button>
         </div>
 
-        <Editor value={() => sql.current} onChange={(v) => { sql.current = v; }} onRun={execute}
-          onSelect={(v) => {
-            selectedSql.current = v;
-            setHasSelection(Boolean(v.trim()));
-          }}
-          revision={ran} height={editorHeight} cols={cols} />
-
-        {/* The handle is 4px of hit area on a 1px line: a divider you can actually grab, without
-            a 4px band of colour across the pane. */}
-        <div {...dragProps} title="Drag to resize"
-          className="group h-1 shrink-0 cursor-row-resize border-t border-subtle transition-colors hover:border-accent-soft" />
-
-        <div className="relative flex shrink-0 items-center gap-2 border-y border-subtle px-3 py-1.5">
+        {view === "diagram" && (
+          <div className="m-2 mt-1.5 flex min-h-0 flex-1 flex-col overflow-hidden rounded-[10px] border border-subtle bg-card">
+            <Diagram tables={schema} fks={fks} layoutKey={conn.id} onOpen={(name) => { setView("query"); pick(name); }} />
+          </div>
+        )}
+        {view === "query" && <>
+        {/* The query: one card, its run controls along the top and the editor under them. */}
+        <div className="mx-2 mt-1.5 flex shrink-0 flex-col overflow-hidden rounded-[10px] border border-subtle bg-card">
+        <div className="flex shrink-0 items-center gap-2 border-b border-subtle px-2 py-1.5">
+          {/* Run all is the screen's one accent action; the rest are secondary. */}
           <button onClick={runAll} disabled={running !== null}
             title="Run everything in the editor"
-            className="flex items-center gap-1.5 rounded-md border border-subtle bg-elev px-2.5 py-1 text-[12px] hover:border-accent-soft disabled:opacity-50">
+            className="flex h-7 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-[12px] font-medium text-white transition hover:brightness-110 disabled:opacity-50 disabled:hover:brightness-100"
+            style={accentFill}>
             {running !== null
               ? <RefreshCw size={12} className="animate-spin" />
               : <Play size={12} />}
@@ -684,51 +740,61 @@ ${String(e)}`);
             title={hasSelection
               ? "Run only the highlighted SQL"
               : "Select some SQL in the editor to run just that"}
-            className="flex items-center gap-1.5 rounded-md border border-subtle bg-elev px-2.5 py-1 text-[12px] hover:border-accent-soft disabled:opacity-40">
+            className={toolBtn}>
             <TextSelect size={12} /> Run selection
           </button>
-          <span className="text-[11px] text-text-muted">Ctrl+Enter</span>
+          <kbd className="rounded-md px-1.5 py-0.5 font-sans text-[10.5px] text-text-muted" style={{ background: "var(--bg-elev)" }}>Ctrl+Enter</kbd>
           {running !== null && <Elapsed since={running} />}
 
-          <button onClick={() => setShowHistory((v) => !v)} disabled={forThisDb.length === 0}
+          {/* aria-expanded tells the menu this button opened it, so pressing it again closes it. */}
+          <button disabled={forThisDb.length === 0} aria-haspopup="menu" aria-expanded={!!historyAt}
+            onClick={(e) => {
+              const r = e.currentTarget.getBoundingClientRect();
+              setHistoryAt((at) => (at ? null : { x: r.left, y: r.bottom + 4 }));
+            }}
             title="Queries you have run against this database"
-            className={`flex items-center gap-1.5 rounded-md border px-2 py-1 text-[12px] disabled:opacity-40 ${
-              showHistory ? "border-accent-soft bg-white/10" : "border-subtle bg-elev hover:border-accent-soft"
-            }`}>
+            className={toolBtn}
+            // Lit while its menu is open.
+            style={historyAt ? { background: "var(--accent-soft)", color: "var(--text-primary)" } : undefined}>
             <History size={12} /> History{forThisDb.length ? ` (${forThisDb.length})` : ""}
           </button>
 
           {!allowWrites && (
-            <span className="ml-auto text-[11px] text-text-muted">Read-only</span>
+            <span className={chipCls + " ml-auto text-text-muted"} style={{ background: "var(--bg-elev)" }}>Read-only</span>
           )}
 
-          {showHistory && forThisDb.length > 0 && (
-            <>
-              {/* A click anywhere else closes it, without a document listener to clean up. */}
-              <div className="fixed inset-0 z-20" onClick={() => setShowHistory(false)} />
-              <div className="absolute left-0 right-0 top-full z-30 mx-3 max-h-80 overflow-auto rounded-lg border border-subtle bg-elev shadow-xl">
-                {forThisDb.map((h, i) => (
-                  <button key={`${h.at}-${i}`}
-                    onClick={() => { setEditorText(h.sql, false); setShowHistory(false); }}
-                    className={`block w-full px-3 py-2 text-left hover:bg-white/5 ${
-                      i === 0 ? "" : "border-t border-subtle/60"
-                    }`}>
-                    <div className="truncate font-mono text-[12px]">{h.sql.replace(/\s+/g, " ")}</div>
-                    <div className="text-[10px] text-text-muted">
-                      {new Date(h.at).toLocaleString()}
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </>
+          {/* Deck's menu: it places and flips itself, and closes on a click anywhere else. */}
+          {historyAt && forThisDb.length > 0 && (
+            <ContextMenu x={historyAt.x} y={historyAt.y} onClose={() => setHistoryAt(null)}
+              items={forThisDb.map((h) => ({
+                label: h.sql.replace(/\s+/g, " "),
+                subLabel: new Date(h.at).toLocaleString(),
+                onClick: () => setEditorText(h.sql, false),
+              }))} />
           )}
         </div>
 
-        <Results results={results} error={error} table={selected} fks={fks} onFollow={follow}
-          running={running}
-          engine={engine} allowWrites={allowWrites} editTable={ranTable}
-          tableColumns={ranTable ? (cols.get(ranTable) ?? []) : []}
-          onEdit={(st) => void applyEdit(st)} />
+        <Editor value={() => sql.current} onChange={(v) => { sql.current = v; }} onRun={execute}
+          onSelect={(v) => {
+            selectedSql.current = v;
+            setHasSelection(Boolean(v.trim()));
+          }}
+          revision={ran} height={editorHeight} cols={cols} />
+        </div>
+
+        {/* The split between the query and its results: a slim bar with room to grab it, lit in
+            the accent while the pointer is on it. */}
+        <div {...dragProps} title="Drag to resize"
+          className="mx-auto my-[3px] h-1 w-16 shrink-0 cursor-row-resize rounded-full bg-white/10 transition-colors hover:bg-[var(--accent)]" />
+
+        <div className="mx-2 mb-2 flex min-h-0 flex-1 flex-col overflow-hidden rounded-[10px] border border-subtle bg-card">
+          <Results results={results} error={error} table={selected} fks={fks} onFollow={follow}
+            running={running} took={took}
+            engine={engine} allowWrites={allowWrites} editTable={ranTable}
+            tableColumns={ranTable ? (cols.get(ranTable) ?? []) : []}
+            onEdit={(st) => void applyEdit(st)} />
+        </div>
+        </>}
       </div>
     </div>
   );
@@ -792,26 +858,33 @@ function Schema({
       <div className="flex shrink-0 flex-col overflow-hidden border-r border-subtle bg-panel/80 backdrop-blur-xl blur-surface"
         style={{ width }}>
         <div className="shrink-0 px-2 pb-1.5 pt-2">
-          <div className="mb-1.5 flex items-baseline gap-1.5 px-1 text-[11px] text-text-muted">
-            <span className="uppercase tracking-wide">
+          <div className="mb-1.5 flex items-baseline gap-1.5 px-1 text-[11.5px] text-text-muted">
+            <span>
               {tableCount} table{tableCount === 1 ? "" : "s"}
             </span>
             {viewCount > 0 && <span>{"·"} {viewCount} view{viewCount === 1 ? "" : "s"}</span>}
           </div>
           {/* Worth its space once a schema is more than a screenful, which is most of them. */}
-          <div className="relative">
-            <Search size={11}
-              className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-text-muted" />
+          <div className="flex h-7 items-center gap-1.5 rounded-lg border border-subtle bg-elev pl-2 pr-1 transition-colors focus-within:border-[var(--accent)]">
+            <Search size={12} className="shrink-0 text-text-muted" />
             <input value={filter} onChange={(e) => setFilter(e.target.value)}
               placeholder="Filter tables and columns"
-              className="h-6 w-full rounded border border-subtle bg-elev pl-6 pr-2 text-[11px] outline-none transition focus:border-accent-soft" />
+              className="min-w-0 flex-1 bg-transparent text-[12px] text-text-primary outline-none placeholder:text-text-muted" />
+            {filter && (
+              <button onClick={() => setFilter("")} title="Clear the filter" className={iconBtn}><X size={12} /></button>
+            )}
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-auto pb-2">
-          {shown.length === 0 && (
-            <p className="px-3 py-4 text-center text-[11px] text-text-muted">Nothing matches.</p>
-          )}
+        <div className="scroll-thin min-h-0 flex-1 overflow-auto px-1.5 pb-2">
+          {shown.length === 0 && (list.length === 0
+            ? <p className="px-1.5 py-3 text-[12px] text-text-muted">This database has no tables or views yet.</p>
+            : (
+              <div className="flex flex-col items-start gap-2 px-1.5 py-3 text-[12px] text-text-muted">
+                <span>No table or column matches “{filter.trim()}”.</span>
+                <button onClick={() => setFilter("")} className={toolBtn}>Clear filter</button>
+              </div>
+            ))}
           {shown.map((t) => {
             const count = counts.get(t.name);
             return (
@@ -821,9 +894,10 @@ function Schema({
                     e.preventDefault();
                     setMenu({ x: e.clientX, y: e.clientY, table: t });
                   }}
-                  className={`flex w-full items-center gap-1 px-2 py-1.5 text-left text-[12px] hover:bg-white/5 ${
-                    selected === t.name ? "bg-white/10" : ""
-                  }`}>
+                  className={`flex h-6 w-full items-center gap-1 rounded-md px-1.5 text-left text-[12.5px] transition-colors ${
+                    selected === t.name ? "text-text-primary" : "text-text-secondary hover:bg-white/5 hover:text-text-primary"
+                  }`}
+                  style={selected === t.name ? { background: "var(--accent-soft)" } : undefined}>
                   <ChevronRight size={11}
                     className={`shrink-0 text-text-muted transition-transform ${
                       open === t.name ? "rotate-90" : ""
@@ -843,7 +917,7 @@ function Schema({
                 </button>
 
                 {open === t.name && (
-                  <div className="pb-1 pl-5 pr-2">
+                  <div className="pb-1 pl-4 pr-1">
                     {t.columns.length === 0 && (
                       <div className="py-0.5 text-[11px] text-text-muted">No columns reported.</div>
                     )}
@@ -853,7 +927,7 @@ function Schema({
                         // find every other table that shares it.
                         onClick={() => setFilter(c.name)}
                         title={`${c.name} ${c.type}${c.notNull ? " not null" : ""}${c.pk ? " primary key" : ""}`}
-                        className="flex cursor-pointer items-center gap-1 py-0.5 text-[11px] hover:bg-white/5">
+                        className="flex cursor-pointer items-center gap-1 rounded-md px-1 py-0.5 text-[11px] transition-colors hover:bg-white/5">
                         {c.pk
                           ? <KeyRound size={9} className="shrink-0 text-amber-400" />
                           : <span className="w-[9px] shrink-0" />}
@@ -871,7 +945,7 @@ function Schema({
                         <summary className="cursor-pointer list-none text-[10px] text-text-muted hover:text-text-secondary">
                           <Code2 size={9} className="mr-1 inline" />CREATE statement
                         </summary>
-                        <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded border border-subtle bg-app/60 p-1.5 text-[10px] leading-snug text-text-secondary">
+                        <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded-md border border-subtle bg-[var(--bg-app)] p-1.5 font-mono text-[10.5px] leading-snug text-text-secondary">
                           {t.sql}
                         </pre>
                       </details>
@@ -886,7 +960,7 @@ function Schema({
 
       {/* 4px of hit area on a 1px line: grabbable without a visible band of colour. */}
       <div {...dragProps} title="Drag to resize"
-        className="w-1 shrink-0 cursor-col-resize border-l border-subtle transition-colors hover:border-accent-soft" />
+        className="w-1 shrink-0 cursor-col-resize border-l border-subtle transition-colors hover:border-[var(--accent)]" />
 
       {menu && (
         <ContextMenu x={menu.x} y={menu.y} onClose={() => setMenu(null)}
@@ -1113,9 +1187,11 @@ function Editor({ value, onChange, onRun, onSelect, revision, height, cols }: {
 /** One grid per statement, plus whatever went wrong. */
 function Results({
   results, error, table, fks, onFollow, engine, allowWrites, editTable, tableColumns, onEdit,
-  running,
+  running, took,
 }: {
   results: Result[]; error: string; table: string | null; running: number | null;
+  /** How long the last run took, in ms. */
+  took: number | null;
   fks: ForeignKeyRef[]; onFollow: (fk: ForeignKeyRef, value: unknown) => void;
   engine: EngineId; allowWrites: boolean; editTable: string | null; tableColumns: Column[];
   onEdit: (statement: string) => void;
@@ -1136,11 +1212,12 @@ function Results({
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-auto">
       {error && (
-        <pre className="m-3 whitespace-pre-wrap rounded-lg border border-red-500/40 bg-red-500/5 p-3 text-[12px] text-red-300">
+        <pre className="m-3 whitespace-pre-wrap rounded-lg border border-red-400/40 bg-red-400/5 p-3 text-[12px] text-red-300">
           {error}
         </pre>
       )}
       {results.map((r, i) => <Grid key={i} result={r} index={i} many={results.length > 1}
+        took={i === results.length - 1 ? took : null}
         fks={table ? fks.filter((f) => f.table === table) : []} onFollow={onFollow}
         engine={engine} table={editTable} allowWrites={allowWrites} tableColumns={tableColumns}
         onEdit={onEdit}
@@ -1148,23 +1225,27 @@ function Results({
       {/* Over a tunnel the first query has nothing to show yet, so the empty state would read as
           "no results" when it means "not finished". */}
       {running !== null && !results.length && (
-        <div className="flex items-center justify-center gap-2 p-8 text-[13px] text-text-muted">
+        <div className="flex items-center justify-center gap-2 p-8 text-[12.5px] text-text-muted">
           <RefreshCw size={14} className="animate-spin" /> Running…
         </div>
       )}
       {!error && !results.length && running === null && (
-        <p className="p-8 text-center text-[13px] text-text-muted">
-          Pick a table, or write a query and press Ctrl+Enter.
-        </p>
+        <div className="m-auto flex flex-col items-center gap-2 p-8 text-center">
+          <span className="grid size-10 place-items-center rounded-full" style={{ background: "var(--bg-elev)" }}>
+            <Table2 size={18} className="text-text-muted" />
+          </span>
+          <span className="text-[13px] font-medium text-text-secondary">No results yet</span>
+          <span className="max-w-xs text-[12px] leading-relaxed text-text-muted">Pick a table on the left, or write a query above and press Ctrl+Enter.</span>
+        </div>
       )}
     </div>
   );
 }
 
 function Grid({
-  result, index, many, fks, onFollow, engine, table, allowWrites, tableColumns, onEdit, onExport,
+  result, index, many, took, fks, onFollow, engine, table, allowWrites, tableColumns, onEdit, onExport,
 }: {
-  result: Result; index: number; many: boolean;
+  result: Result; index: number; many: boolean; took: number | null;
   fks: ForeignKeyRef[]; onFollow: (fk: ForeignKeyRef, value: unknown) => void;
   engine: EngineId; table: string | null; allowWrites: boolean; tableColumns: Column[];
   onEdit: (statement: string) => void;
@@ -1178,6 +1259,10 @@ function Grid({
   // does not: a wrong value can be typed over, and a prompt on every cell would make the grid
   // unusable as an editor.
   const [confirm, setConfirm] = useState<ConfirmState | null>(null);
+  // The cell last clicked, ringed so it is plain which value a double-click would edit.
+  const [picked, setPicked] = useState<{ row: number; col: number } | null>(null);
+  // Each column's declared type, when the rows are one table's: shown under its name.
+  const typeOf = (col: string) => tableColumns.find((c) => c.name === col)?.type ?? "";
 
   // Why this result cannot be written to, if it cannot. Only the FIRST result of a script is
   // editable: the others are not what the grid is showing a table for.
@@ -1211,28 +1296,35 @@ function Grid({
     );
   }
   return (
-    <div className="flex min-h-0 flex-col border-b border-subtle/60 last:border-0">
-      <div className="flex items-center gap-2 px-3 py-1.5 text-[11px] text-text-muted">
-        {many && <span className="text-text-secondary">#{index + 1}</span>}
-        <span className="tabular-nums">
+    <div className="flex min-h-0 flex-col border-b border-subtle last:border-0">
+      <div className="flex h-9 shrink-0 items-center gap-2 px-3 text-[11.5px] text-text-muted">
+        {many && <span className={chipCls + " text-text-secondary"} style={{ background: "var(--bg-elev)" }}>#{index + 1}</span>}
+        <span className="tabular-nums text-text-secondary">
           {result.truncated
-            ? `showing ${result.rows.length.toLocaleString()} of ${result.total.toLocaleString()} rows (capped at ${ROW_CAP.toLocaleString()})`
+            ? `${result.rows.length.toLocaleString()} of ${result.total.toLocaleString()} rows`
             : `${result.total.toLocaleString()} row${result.total === 1 ? "" : "s"}`}
         </span>
+        {result.truncated && (
+          <span className={chipCls} title={`Only the first ${ROW_CAP.toLocaleString()} rows are shown`}
+            style={{ color: "rgb(var(--tone-amber-400))", background: "color-mix(in srgb, rgb(var(--tone-amber-400)) 14%, transparent)" }}>
+            Capped at {ROW_CAP.toLocaleString()}
+          </span>
+        )}
+        {took !== null && <span className="tabular-nums">{took < 1000 ? `${took} ms` : `${(took / 1000).toFixed(1)} s`}</span>}
         <span className="ml-auto" />
         {canEdit && (
           <button onClick={() => setAdding({})} disabled={!!adding} title="Insert a new row"
-            className="flex items-center gap-1 rounded border border-subtle bg-elev px-1.5 py-0.5 hover:text-text-primary disabled:opacity-40">
+            className={smallBtn}>
             <Plus size={11} /> Row
           </button>
         )}
         {allowWrites && blocked && (
           // Said plainly rather than leaving editing mysteriously absent: the reason is always
           // something the user can act on — select the key, or query one table.
-          <span className="text-[11px] text-text-muted" title={blocked}>read-only result</span>
+          <span className="text-[11px] text-text-muted" title={blocked}>Read-only result</span>
         )}
         <button onClick={onExport} title="Copy as CSV"
-          className="flex items-center gap-1 rounded border border-subtle bg-elev px-1.5 py-0.5 hover:text-text-primary">
+          className={smallBtn}>
           <Download size={11} /> CSV
         </button>
       </div>
@@ -1241,33 +1333,41 @@ function Grid({
           column headers need their vertical scroll container to be an ancestor — otherwise they
           have nothing to stick to and scroll away with the rows. */}
       <div className="min-h-0 overflow-auto">
-        <table className="w-full border-collapse text-[12px]">
+        {/* Columns as wide as what is in them, not stretched to the pane: across a wide window a
+            stretched number column puts the value a screen away from its heading. */}
+        <table className="w-max min-w-[50%] border-collapse text-[12px]">
           <thead>
             <tr>
+              {/* The row number, for finding your place in a long result. */}
+              <th className="sticky left-0 top-0 z-20 w-10 border-b border-r border-b-subtle border-r-white/[0.06] bg-panel px-2 py-1.5 text-right text-[10.5px] font-normal text-text-muted">#</th>
               {result.columns.map((c, ci) => (
                 <th key={c} onClick={() => toggle(ci)}
                   title={`Sort by ${c}${result.truncated ? " (the rows on screen)" : ""}`}
-                  className={`sticky top-0 z-10 cursor-pointer select-none whitespace-nowrap border-b border-b-subtle bg-app px-2 py-1 text-left font-medium hover:text-text-primary ${
+                  className={`group/th sticky top-0 z-10 cursor-pointer select-none whitespace-nowrap border-b border-b-subtle bg-panel px-2.5 py-1.5 text-left align-top font-medium text-text-secondary transition-colors hover:text-text-primary ${
                   // Each side named explicitly. `border-b border-subtle` would set the colour of
                   // ALL FOUR sides, and whether the later border-r-white/20 wins then depends on
                   // stylesheet order rather than class order — which is why the header rules were
                   // missing while the body's were fine.
-                  ci === result.columns.length - 1 ? "" : "border-r border-r-white/20"
+                  ci === result.columns.length - 1 ? "" : "border-r border-r-white/[0.06]"
                 }`}>
-                  <span className="inline-flex items-center gap-1">
+                  <span className="flex items-center gap-1">
                     {c}
-                    {fkFor(c) && <Link2 size={9} className="text-text-muted" />}
-                    {sort?.index === ci && (sort.dir === "asc"
-                      ? <ArrowUp size={10} className="text-accent" />
-                      : <ArrowDown size={10} className="text-accent" />)}
+                    {fkFor(c) && <Link2 size={10} className="text-text-muted" />}
+                    {sort?.index === ci
+                      ? (sort.dir === "asc"
+                        ? <ArrowUp size={11} style={{ color: "var(--accent)" }} />
+                        : <ArrowDown size={11} style={{ color: "var(--accent)" }} />)
+                      : <ArrowUp size={11} className="opacity-0 transition-opacity group-hover/th:opacity-40" />}
                   </span>
+                  {typeOf(c) && <span className="block font-mono text-[10px] font-normal text-text-muted">{shortType(typeOf(c))}</span>}
                 </th>
               ))}
             </tr>
           </thead>
           <tbody>
             {rows.map((row, ri) => (
-              <tr key={ri} className="group/row hover:bg-white/5">
+              <tr key={ri} className="group/row hover:bg-white/[0.03]">
+                <td className="sticky left-0 border-b border-r border-white/[0.05] bg-card px-2 py-1 text-right text-[10.5px] tabular-nums text-text-muted group-hover/row:text-text-secondary">{ri + 1}</td>
                 {row.map((v, ci) => {
                   const { text, kind } = cell(v);
                   // A declared foreign key with a value is clickable: it shows the row it names.
@@ -1285,7 +1385,7 @@ function Grid({
                       ));
                     };
                     return (
-                      <td key={ci} className="border-b border-r border-white/20 border-r-white/20 p-0">
+                      <td key={ci} className="border-b border-r border-white/[0.05] p-0">
                         <input autoFocus value={draft}
                           onChange={(e) => setDraft(e.target.value)}
                           onBlur={commit}
@@ -1295,12 +1395,14 @@ function Grid({
                             // mistyped cell would be to commit it.
                             if (e.key === "Escape") setEditing(null);
                           }}
-                          className="w-full bg-elev px-2 py-1 text-[12px] text-text-primary outline-none ring-1 ring-inset ring-accent-soft" />
+                          className="w-full bg-elev px-2.5 py-1 text-[12px] text-text-primary outline-none ring-1 ring-inset ring-[var(--accent)]" />
                       </td>
                     );
                   }
+                  const isPicked = picked?.row === ri && picked.col === ci;
                   return (
                     <td key={ci}
+                      onClick={() => setPicked({ row: ri, col: ci })}
                       onDoubleClick={canEdit ? () => {
                         setEditing({ row: ri, col: ci });
                         // NULL edits as empty, so clearing a cell and setting it to NULL are the
@@ -1312,24 +1414,26 @@ function Grid({
                         : canEdit ? `${text}
 
 Double-click to edit` : text}
-                      className={`max-w-[28rem] truncate border-b border-white/20 px-2 py-1 ${
-                        ci === row.length - 1 ? "" : "border-r border-r-white/20"
+                      className={`max-w-[28rem] truncate border-b border-white/[0.05] px-2.5 py-1 ${
+                        ci === row.length - 1 ? "" : "border-r border-r-white/[0.05]"
                       } ${
-                        kind === "null" ? "italic text-text-muted"
-                          : kind === "blob" ? "text-text-muted"
-                            : kind === "number" ? "text-right tabular-nums" : ""
-                      }`}>
+                        kind === "blob" ? "text-text-muted"
+                          : kind === "number" ? "text-right tabular-nums text-text-primary" : "text-text-primary"
+                      } ${isPicked ? "bg-[var(--accent-soft)] outline outline-1 -outline-offset-1 outline-[var(--accent)]" : ""}`}>
                       {fk ? (
                         <button onClick={() => onFollow(fk, v)}
-                          className="text-accent underline decoration-dotted underline-offset-2 hover:decoration-solid">
+                          className="underline decoration-dotted underline-offset-2 hover:decoration-solid" style={{ color: "var(--accent)" }}>
                           {text}
                         </button>
+                      ) : kind === "null" ? (
+                        // NULL is not the text "NULL": a quiet tag, so it cannot be mistaken for a value.
+                        <span className="rounded px-1 text-[10px] tracking-wide text-text-muted" style={{ background: "var(--bg-elev)" }}>NULL</span>
                       ) : text}
                     </td>
                   );
                 })}
                 {canEdit && (
-                  <td className="w-8 border-b border-white/20 px-1 text-center">
+                  <td className="w-8 border-b border-white/[0.05] px-1 text-center">
                     <button
                       onClick={() => {
                         const statement = deleteStatement(engine, table!, result.columns, row, pk);
@@ -1340,7 +1444,7 @@ Double-click to edit` : text}
                           body: (
                             <div className="space-y-2">
                               <p>This cannot be undone.</p>
-                              <pre className="overflow-x-auto rounded border border-subtle bg-app/60 p-2 text-[11px] text-text-secondary">
+                              <pre className="overflow-x-auto rounded-md border border-subtle bg-[var(--bg-app)] p-2 font-mono text-[11px] text-text-secondary">
                                 {statement}
                               </pre>
                             </div>
@@ -1350,8 +1454,8 @@ Double-click to edit` : text}
                         });
                       }}
                       title="Delete this row"
-                      className="text-text-muted opacity-0 transition group-hover/row:opacity-100 hover:text-red-400">
-                      <Trash2 size={11} />
+                      className="grid size-5 place-items-center rounded text-text-muted opacity-0 transition group-hover/row:opacity-100 hover:bg-white/10 hover:text-red-400">
+                      <Trash2 size={12} />
                     </button>
                   </td>
                 )}
@@ -1360,9 +1464,10 @@ Double-click to edit` : text}
             {/* The new-row form, as the last row of the table so the columns line up with the
                 data above it rather than being a separate dialog that has to repeat them. */}
             {adding && (
-              <tr className="bg-white/[0.04]">
+              <tr style={{ background: "var(--accent-soft)" }}>
+                <td className="sticky left-0 border-b border-r border-white/[0.05] bg-card px-2 py-1 text-right text-[10.5px] text-text-muted">+</td>
                 {result.columns.map((c) => (
-                  <td key={c} className="border-b border-r border-white/20 border-r-white/20 p-0">
+                  <td key={c} className="border-b border-r border-white/[0.05] p-0">
                     <input value={adding[c] ?? ""}
                       onChange={(e) => setAdding({ ...adding, [c]: e.target.value })}
                       onKeyDown={(e) => { if (e.key === "Enter") commitAdd(); }}
