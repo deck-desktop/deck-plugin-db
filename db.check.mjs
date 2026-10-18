@@ -411,26 +411,23 @@ assert.equal(q.nextTabName([{ id: "1", name: "Query 1", sql: "" }, { id: "3", na
 assert.equal(q.nextTabName([]), "Query 1");
 
 // ---- engines --------------------------------------------------------------------------------
-const SQL_ENGINES = ["sqlite", "duckdb", "postgres", "mysql", "mssql"];
+const SQL_ENGINES = ["sqlite", "postgres", "mysql", "mssql"];
 for (const e of SQL_ENGINES) assert.ok(q.isSql(e), `${e} is SQL`);
 assert.equal(q.isSql("redis"), false);
 assert.equal(q.isSql("mongo"), false);
-assert.ok(q.isFile("sqlite") && q.isFile("duckdb") && !q.isFile("postgres") && !q.isFile("mongo"));
+assert.ok(q.isFile("sqlite") && !q.isFile("postgres") && !q.isFile("mongo"));
 
 // A file is opened by Deck as `<scheme>:<absolute path>`; a server's url goes as it is.
 assert.equal(q.connectUrl("sqlite", "C:\\data\\a.db"), "sqlite:C:\\data\\a.db");
-assert.equal(q.connectUrl("duckdb", "D:/x.duckdb"), "duckdb:D:/x.duckdb");
 assert.equal(q.connectUrl("redis", "redis://h:6379/0"), "redis://h:6379/0");
 
-// Quoting: SQL Server brackets (a ] doubled), DuckDB the standard double quote.
+// Quoting: SQL Server brackets (a ] doubled).
 assert.equal(q.quoteFor("mssql", "order"), "[order]");
 assert.equal(q.quoteFor("mssql", "a]b"), "[a]]b]", "a closing bracket is doubled");
-assert.equal(q.quoteFor("duckdb", 'we"ird'), '"we""ird"');
 assert.equal(q.quoteFor("redis", "user:*"), "user:*", "Redis has nothing to quote");
 
 // Previews, one per engine's language.
 assert.equal(q.previewFor("mssql", "t"), "select top 200 * from [t];");
-assert.equal(q.previewFor("duckdb", "t"), 'select * from "t" limit 200;');
 assert.equal(q.previewFor("redis", "user:*"), "SCAN 0 MATCH user:*", "a key group's name is its MATCH pattern");
 assert.equal(q.previewFor("redis", 'my key*'), 'SCAN 0 MATCH "my key*"', "a pattern with a space is quoted");
 assert.equal(q.previewFor("redis", 'a"b'), 'SCAN 0 MATCH "a\\"b"', "and a quote in it escaped");
@@ -461,15 +458,13 @@ for (const e of SQL_ENGINES) assert.equal(q.engineEditBlock(e), null);
 assert.match(q.engineEditBlock("redis") ?? "", /command/);
 assert.match(q.engineEditBlock("mongo") ?? "", /command/);
 
-// Explain: unavailable on SQL Server, Redis and MongoDB; plain EXPLAIN on DuckDB.
+// Explain: unavailable on SQL Server, Redis and MongoDB.
 assert.equal(q.explainFor("mssql", "select 1"), null);
 assert.equal(q.explainFor("redis", "GET a"), null);
 assert.equal(q.explainFor("mongo", "{}"), null);
-assert.equal(q.explainFor("duckdb", "select 1;"), "explain select 1");
 
 // Format: each SQL engine in its own dialect; the others are not SQL.
 assert.match(q.formatSql("mssql", "select [a b] from t"), /\[a b\]/, "SQL Server's brackets survive");
-assert.match(q.formatSql("duckdb", "select x::int from t"), /x::int/);
 assert.throws(() => q.formatSql("redis", "GET a"), /not SQL/);
 
 // Export on SQL Server: N'' strings and bits as 1 and 0.
@@ -483,8 +478,6 @@ assert.equal(
   const ms = q.structureQueries("mssql", "o'k");
   assert.match(ms.indexes, /quotename\(N'o''k'\)/, "the table name is a literal, quote doubled");
   assert.equal(ms.create, null);
-  const dk = q.structureQueries("duckdb", "t");
-  assert.match(dk.indexes, /duckdb_indexes\(\)/);
   assert.deepEqual(q.structureQueries("redis", "user:*"), { defaults: null, indexes: null, create: null });
   const mg = q.structureQueries("mongo", "users");
   assert.deepEqual(JSON.parse(mg.indexes), { listIndexes: "users" });
@@ -496,7 +489,7 @@ assert.equal(
     total: 2, truncated: false,
   });
   assert.deepEqual(mix.map((i) => [i.name, i.unique, i.columns]), [["_id_", false, ["_id"]], ["email_1_at_-1", true, ["email", "at"]]]);
-  // DuckDB: a flag and a definition, the columns read from the definition.
+  // A flag and a definition: the columns are read from the definition.
   const dix = q.parseIndexes({
     columns: ["name", "uniq", "definition"],
     rows: [["ix", false, "CREATE INDEX ix ON t(a, b);"]], total: 1, truncated: false,

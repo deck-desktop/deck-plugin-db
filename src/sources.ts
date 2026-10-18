@@ -5,7 +5,7 @@
 // exist in that harness.
 //
 // Every engine is opened the same way, by a url whose scheme picks it (`sqlite:<path>`,
-// `duckdb:<path>`, postgres://, mysql://, mssql://, redis://, mongodb://), and the connection
+// postgres://, mysql://, mssql://, redis://, mongodb://), and the connection
 // lives in Rust. A file is opened in place, not copied: with writes allowed, a write reaches the
 // file itself.
 import {
@@ -58,7 +58,7 @@ export async function openNative(
         tables: s.tables.map((t) => ({
           name: t.name,
           kind: t.kind,
-          // The CREATE statement where the engine keeps one (SQLite, DuckDB); information_schema
+          // The CREATE statement where the engine keeps one (SQLite); information_schema
           // has no equivalent to show.
           sql: t.sql ?? "",
           columns: t.columns.map((c) => ({

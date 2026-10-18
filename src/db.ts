@@ -4,7 +4,7 @@
 // check it in node. The UI is a thin layer over this file — which is the point: a wrong quote
 // character or a statement splitter that breaks on a semicolon inside a string literal looks
 // entirely plausible on screen.
-import { formatDialect, duckdb, mysql, postgresql, sqlite as sqliteDialect, transactsql } from "sql-formatter";
+import { formatDialect, mysql, postgresql, sqlite as sqliteDialect, transactsql } from "sql-formatter";
 
 /** How many rows one page of a result holds: what Deck's db_query returns at most. */
 export const ROW_CAP = 1000;
@@ -237,7 +237,7 @@ export function textToRun(all: string, selected: string): string {
 // ABOVE this line is shared. What differs per engine is decided here, so the UI takes a `Source`
 // and asks these functions rather than branching on the engine itself.
 
-export type EngineId = "sqlite" | "duckdb" | "postgres" | "mysql" | "mssql" | "redis" | "mongo";
+export type EngineId = "sqlite" | "postgres" | "mysql" | "mssql" | "redis" | "mongo";
 
 /**
  * Whether an engine speaks SQL. Redis takes one command line and MongoDB one JSON command, so the
@@ -249,7 +249,7 @@ export function isSql(engine: EngineId): boolean {
 
 /** Whether a connection names a file (picked from disk) rather than a server url. */
 export function isFile(engine: EngineId): boolean {
-  return engine === "sqlite" || engine === "duckdb";
+  return engine === "sqlite";
 }
 
 /** The url Deck's dbConnect takes: a file engine's path behind its scheme, a server's url as is. */
@@ -285,12 +285,12 @@ export function appendPage(prev: Result, next: Result): Result {
   return { columns: prev.columns, rows, total: rows.length, truncated: next.truncated };
 }
 
-/** One saved connection. A file path for SQLite and DuckDB, a url for the others. */
+/** One saved connection. A file path for SQLite, a url for the others. */
 export interface Connection {
   id: string;
   name: string;
   engine: EngineId;
-  /** File path (SQLite, DuckDB) or a postgres:// | mysql:// | mssql:// | redis:// | mongodb:// url. */
+  /** File path (SQLite) or a postgres:// | mysql:// | mssql:// | redis:// | mongodb:// url. */
   target: string;
   /** Off by default. Per connection, because "safe to write to" is a property of the database. */
   allowWrites: boolean;
@@ -341,8 +341,8 @@ export interface SchemaTable extends Table {
 /**
  * What the UI drives. Every engine satisfies it, so no component holds a connection itself.
  *
- * `close` matters more than it looks: a source holds a file open (which, for DuckDB, locks other
- * programs out of it) or real connections on someone else's machine. Neither should outlive the tab.
+ * `close` matters more than it looks: a source holds a file open or real connections on someone
+ * else's machine. Neither should outlive the tab.
  */
 export interface Source {
   engine: EngineId;
@@ -639,7 +639,7 @@ export function prettyJson(v: unknown): string | null {
  * SQL; the UI offers Format only where `isSql` says so.
  */
 export function formatSql(engine: EngineId, sql: string): string {
-  const dialect = { sqlite: sqliteDialect, duckdb, postgres: postgresql, mysql, mssql: transactsql }[engine as string];
+  const dialect = { sqlite: sqliteDialect, postgres: postgresql, mysql, mssql: transactsql }[engine as string];
   if (!dialect) throw new Error(`${engine} is not SQL`);
   return formatDialect(sql, { dialect });
 }
@@ -690,10 +690,10 @@ export interface IndexInfo {
  * The queries behind the Structure view, each null where the engine has no such thing.
  *
  * `defaults` returns (name, dflt). `indexes` returns (name, uniq, col), a row per indexed column;
- * or (name, definition) on Postgres, whose pg_indexes holds the whole definition, and DuckDB,
- * whose duckdb_indexes() does too; or MongoDB's listIndexes documents (name, key, unique).
+ * or (name, definition) on Postgres, whose pg_indexes holds the whole definition; or MongoDB's
+ * listIndexes documents (name, key, unique).
  * `create` returns the table's DDL as its second column where the engine can give it: MySQL only,
- * since SQLite's and DuckDB's are already in the schema and Postgres and SQL Server keep none.
+ * since SQLite's is already in the schema and Postgres and SQL Server keep none.
  * A Redis key group has no defaults, indexes or DDL at all.
  */
 export function structureQueries(engine: EngineId, table: string): {
@@ -702,15 +702,6 @@ export function structureQueries(engine: EngineId, table: string): {
   if (engine === "redis") return { defaults: null, indexes: null, create: null };
   if (engine === "mongo") return { defaults: null, indexes: JSON.stringify({ listIndexes: table }), create: null };
   const t = strFor(engine, table);
-  if (engine === "duckdb") {
-    return {
-      defaults: `select column_name as name, column_default as dflt from information_schema.columns
-        where table_schema = current_schema() and table_name = ${t}`,
-      indexes: `select index_name as name, is_unique as uniq, sql as definition from duckdb_indexes()
-        where schema_name = current_schema() and table_name = ${t} order by index_name`,
-      create: null,
-    };
-  }
   if (engine === "mssql") {
     return {
       defaults: `select column_name as name, column_default as dflt from information_schema.columns

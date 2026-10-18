@@ -1,4 +1,4 @@
-// Databases — open a SQLite or DuckDB file, or connect to Postgres, MySQL, SQL Server, Redis or
+// Databases — open a SQLite file, or connect to Postgres, MySQL, SQL Server, Redis or
 // MongoDB, and run queries.
 //
 // Every engine goes through Deck's own db_* commands, which hold the connection in Rust: a
@@ -127,7 +127,7 @@ export default function Database() {
   cfgRef.current = cfg;
 
   // The live source, so leaving the tab frees it. Without this every visit opens another copy —
-  // another open file (a DuckDB one locks other programs out), or another pair of pools on
+  // another open file, or another pair of pools on
   // someone else's server.
   const srcRef = useRef<Source | null>(null);
   useEffect(() => () => { void srcRef.current?.close(); srcRef.current = null; }, []);
@@ -299,7 +299,6 @@ function blank(engine: EngineId): Connection {
  */
 const ENGINES: { id: EngineId; label: string; hint: string; ext?: string; port?: number; ask: string }[] = [
   { id: "sqlite", label: "SQLite", hint: "A .db, .sqlite or .sqlite3 file", ext: "db", ask: "write a query above" },
-  { id: "duckdb", label: "DuckDB", hint: "A .duckdb file", ext: "duckdb", ask: "write a query above" },
   { id: "postgres", label: "Postgres", hint: "postgres://user:password@host:5432/database", port: 5432, ask: "write a query above" },
   { id: "mysql", label: "MySQL", hint: "mysql://user:password@host:3306/database", port: 3306, ask: "write a query above" },
   {
@@ -527,7 +526,7 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
         <div className="flex items-start gap-2.5 rounded-lg border border-subtle bg-elev px-3 py-3 text-[12.5px] leading-relaxed text-text-muted">
           <DatabaseIcon size={16} className="mt-0.5 shrink-0" />
           <div className="flex flex-col items-start gap-2.5">
-            <span>Open a SQLite or DuckDB file, or connect to Postgres, MySQL, SQL Server, Redis or MongoDB, to browse what it holds and run queries. A connection is read-only until you allow writes.</span>
+            <span>Open a SQLite file, or connect to Postgres, MySQL, SQL Server, Redis or MongoDB, to browse what it holds and run queries. A connection is read-only until you allow writes.</span>
             <button onClick={() => setDraft(blank("sqlite"))} className={primaryBtn} style={accentFill}>
               <Plus size={14} /> Add a connection
             </button>
@@ -560,7 +559,7 @@ function fileName(path: string): string {
 }
 
 function defaultName(c: Connection): string {
-  if (isFile(c.engine)) return c.target ? fileName(c.target) : c.engine === "duckdb" ? "database.duckdb" : "database.db";
+  if (isFile(c.engine)) return c.target ? fileName(c.target) : "database.db";
   // The database name out of the url, which is the part a person recognises.
   const m = /\/([^/?#]+)(?:[?#]|$)/.exec(c.target.replace(/^\w+:\/\/[^/]*/, ""));
   return m?.[1] ?? c.engine;
