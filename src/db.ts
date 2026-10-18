@@ -1,24 +1,12 @@
-// The SQLite browser's logic, with no React and no sql.js import in sight.
+// The Databases plugin's logic, with no React and no Deck bridge in sight.
 //
-// Everything here is a pure function of a database handle or of a string, so it can be checked
-// by `node plugins/sqlite/sqlite.check.mjs` against a real database. The UI is a thin layer over
-// this file — which is the point: a wrong column type or a statement splitter that breaks on a
-// semicolon inside a string literal looks entirely plausible on screen.
+// Everything here is a pure function of a string or a result, so `npm test` (db.check.mjs) can
+// check it in node. The UI is a thin layer over this file — which is the point: a wrong quote
+// character or a statement splitter that breaks on a semicolon inside a string literal looks
+// entirely plausible on screen.
+import { formatDialect, duckdb, mysql, postgresql, sqlite as sqliteDialect, transactsql } from "sql-formatter";
 
-/** The subset of sql.js this file needs, so nothing here imports sql.js's types. */
-export interface Db {
-  exec(sql: string): { columns: string[]; values: unknown[][] }[];
-  prepare(sql: string): Stmt;
-  /** Frees the wasm heap the database occupies. An unclosed handle leaks the whole file. */
-  close(): void;
-}
-interface Stmt {
-  step(): boolean;
-  getAsObject(): Record<string, unknown>;
-  free(): void;
-}
-
-/** How many rows a single result will hold before it is truncated. */
+/** How many rows one page of a result holds: what Deck's db_query returns at most. */
 export const ROW_CAP = 1000;
 
 export interface Column {
@@ -38,76 +26,10 @@ export interface Table {
 export interface Result {
   columns: string[];
   rows: unknown[][];
-  /** Rows the query actually produced, which is larger than `rows.length` when capped. */
+  /** Rows in this result, which is `rows.length`: Deck reads a page, not the whole result. */
   total: number;
+  /** More rows exist past these: the grid offers to load the next page. */
   truncated: boolean;
-}
-
-/** Rows from a select, as objects. sql.js hands back columns and values separately. */
-function rows(db: Db, sql: string): Record<string, unknown>[] {
-  const out: Record<string, unknown>[] = [];
-  const stmt = db.prepare(sql);
-  try {
-    while (stmt.step()) out.push(stmt.getAsObject());
-  } finally {
-    stmt.free();
-  }
-  return out;
-}
-
-/**
- * Every table and view, in the order SQLite lists them.
- *
- * `sqlite_%` and `sqlite_sequence` are SQLite's own bookkeeping. They are hidden rather than
- * shown greyed out: nobody browsing their own schema means to look at them, and the one time
- * they matter (`sqlite_sequence` after a delete) is better served by typing the query.
- */
-export function tables(db: Db): Table[] {
-  return rows(
-    db,
-    `select name, type, coalesce(sql, '') as sql from sqlite_master
-     where type in ('table','view') and name not like 'sqlite_%'
-     order by type, name`,
-  ).map((r) => ({
-    name: String(r.name),
-    kind: r.type === "view" ? "view" : "table",
-    sql: String(r.sql),
-  }));
-}
-
-/**
- * One table's columns.
- *
- * `pragma table_info` rather than parsing the CREATE statement, because the stored SQL is
- * whatever the author typed — a parser for it would be a parser for the whole of SQLite's DDL
- * grammar, and the pragma is the answer SQLite itself computed.
- */
-export function columns(db: Db, table: string): Column[] {
-  return rows(db, `pragma table_info(${quoteIdent(table)})`).map((r) => ({
-    name: String(r.name),
-    // A column declared with no type is legal in SQLite and comes back as "".
-    type: String(r.type ?? ""),
-    notNull: Number(r.notnull) === 1,
-    pk: Number(r.pk) > 0,
-  }));
-}
-
-/** A table's row count. Separate from `tables` so opening a database does not scan every one. */
-export function rowCount(db: Db, table: string): number {
-  const r = db.exec(`select count(*) from ${quoteIdent(table)}`);
-  return Number(r[0]?.values?.[0]?.[0] ?? 0);
-}
-
-/**
- * Quote an identifier for interpolation into SQL.
- *
- * Table names come from sqlite_master rather than from the user, so this is not the boundary a
- * parameterised query would be. It is here for the ordinary case instead: a table called `order`
- * or `my table` is a syntax error unquoted, and doubling any embedded quote is what makes the
- * quoting total rather than mostly working.
- */
-export function quoteIdent(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`;
 }
 
 /**
@@ -121,7 +43,17 @@ export function quoteIdent(name: string): string {
  * everything that changes what a `;` means. A trailing statement with no semicolon counts.
  */
 export function splitStatements(sql: string): string[] {
-  const out: string[] = [];
+  return statementRanges(sql).map(([a, b]) => sql.slice(a, b).trim()).filter(Boolean);
+}
+
+/**
+ * Where each statement of a script starts and ends, as [start, end) offsets.
+ *
+ * The walk behind `splitStatements`, kept separate so "the statement under the cursor" can be
+ * answered by the same quoting rules rather than a second, slightly different splitter.
+ */
+function statementRanges(sql: string): [number, number][] {
+  const out: [number, number][] = [];
   let start = 0;
   let i = 0;
   while (i < sql.length) {
@@ -146,13 +78,31 @@ export function splitStatements(sql: string): string[] {
       while (i < sql.length && !(sql[i] === "*" && sql[i + 1] === "/")) i++;
       i += 2;
     } else if (c === ";") {
-      out.push(sql.slice(start, i));
+      out.push([start, i]);
       start = i + 1;
       i++;
     } else i++;
   }
-  out.push(sql.slice(start));
-  return out.map((s) => s.trim()).filter(Boolean);
+  out.push([start, sql.length]);
+  return out;
+}
+
+/**
+ * The statement the cursor is in, for Explain: the one statement the user means without
+ * selecting it.
+ *
+ * A cursor right after a `;` belongs to the statement it ends, since that is where it is left
+ * after typing one. A cursor in trailing blank space falls to the last statement before it.
+ */
+export function statementAt(sql: string, offset: number): string {
+  const all = statementRanges(sql)
+    .map(([a, b]) => ({ a, b, text: sql.slice(a, b).trim() }))
+    .filter((s) => s.text);
+  if (!all.length) return "";
+  const at = all.find((s) => offset >= s.a && offset <= s.b + 1)
+    ?? [...all].reverse().find((s) => s.b < offset)
+    ?? all[0];
+  return at.text;
 }
 
 /**
@@ -194,34 +144,6 @@ function stripLeading(sql: string): string {
 }
 
 /**
- * Run one statement and shape the answer for the grid.
- *
- * sql.js returns an empty array for a statement that yields no rows — an `insert`, but equally a
- * `select` that matched nothing. Both are reported as zero rows with no columns, which is honest:
- * the distinction that matters to the reader is the row count, and it is the same either way.
- *
- * Capped at ROW_CAP because `select * from` a large table otherwise builds a million DOM rows and
- * locks the renderer. The full count is reported alongside so the truncation is never silent.
- */
-export function run(db: Db, sql: string): Result {
-  const res = db.exec(sql);
-  const first = res[0];
-  if (!first) return { columns: [], rows: [], total: 0, truncated: false };
-  const total = first.values.length;
-  return {
-    columns: first.columns,
-    rows: total > ROW_CAP ? first.values.slice(0, ROW_CAP) : first.values,
-    total,
-    truncated: total > ROW_CAP,
-  };
-}
-
-/** The default query for a table: enough rows to see the shape, few enough to stay instant. */
-export function previewQuery(table: string): string {
-  return `select * from ${quoteIdent(table)} limit 200;`;
-}
-
-/**
  * Render one cell for display.
  *
  * NULL is rendered as the word rather than as an empty cell, because an empty string and a NULL
@@ -243,36 +165,6 @@ export function toCsv(result: Result): string {
     return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
   };
   return [result.columns.join(","), ...result.rows.map((r) => r.map(esc).join(","))].join("\n");
-}
-
-/** One declared foreign key: this table's `column` points at `table`.`toColumn`. */
-export interface ForeignKey {
-  column: string;
-  table: string;
-  toColumn: string;
-}
-
-/**
- * A table's declared foreign keys.
- *
- * Only what the schema states. A `*_id` column with no declared key is NOT inferred: guessing
- * that `category_id` means `categories.id` is right until the one time it is not, and a browser
- * that silently follows a link the schema never declared is worse than one that follows none.
- */
-export function foreignKeys(db: Db, table: string): ForeignKey[] {
-  return rows(db, `pragma foreign_key_list(${quoteIdent(table)})`).map((r) => ({
-    column: String(r.from),
-    table: String(r.table),
-    toColumn: String(r.to ?? "id"),
-  }));
-}
-
-/** The query behind a foreign-key click: the one row on the far side of the reference. */
-export function lookupQuery(fk: ForeignKey, value: unknown): string {
-  // Numbers unquoted, everything else single-quoted with its quotes doubled. A key is an integer
-  // in almost every schema, but a TEXT key is legal and would be a syntax error interpolated bare.
-  const literal = typeof value === "number" ? String(value) : `'${String(value).replace(/'/g, "''")}'`;
-  return `select * from ${quoteIdent(fk.table)} where ${quoteIdent(fk.toColumn)} = ${literal};`;
 }
 
 /**
@@ -340,19 +232,65 @@ export function textToRun(all: string, selected: string): string {
 
 // ---- engines -------------------------------------------------------------------------------
 //
-// SQLite runs here, in wasm, against a file. Postgres and MySQL run in Rust, because a webview
-// cannot open a TCP socket. Everything ABOVE this line is shared: the statement splitter, the
-// read-only allowlist, sorting, CSV, the cell renderer. Only these three functions differ, so
-// the UI takes a `Source` and never asks which engine it is holding.
+// Every engine runs in Rust behind one handle API (Deck's db_* commands): a webview cannot open a
+// TCP socket, and a database file is better opened in place than read into memory. Everything
+// ABOVE this line is shared. What differs per engine is decided here, so the UI takes a `Source`
+// and asks these functions rather than branching on the engine itself.
 
-export type EngineId = "sqlite" | "postgres" | "mysql";
+export type EngineId = "sqlite" | "duckdb" | "postgres" | "mysql" | "mssql" | "redis" | "mongo";
 
-/** One saved connection. A file path for sqlite, a url for the others. */
+/**
+ * Whether an engine speaks SQL. Redis takes one command line and MongoDB one JSON command, so the
+ * statement splitter, the SQL read-only allowlist, grid editing and INSERT export do not apply.
+ */
+export function isSql(engine: EngineId): boolean {
+  return engine !== "redis" && engine !== "mongo";
+}
+
+/** Whether a connection names a file (picked from disk) rather than a server url. */
+export function isFile(engine: EngineId): boolean {
+  return engine === "sqlite" || engine === "duckdb";
+}
+
+/** The url Deck's dbConnect takes: a file engine's path behind its scheme, a server's url as is. */
+export function connectUrl(engine: EngineId, target: string): string {
+  return isFile(engine) ? `${engine}:${target}` : target;
+}
+
+/**
+ * What one run sends, as separate statements.
+ *
+ * SQL is split, so a script's statements run one by one and a failure names the one that failed.
+ * A Redis command line or a MongoDB command is ONE thing whatever it contains: a `;` inside a
+ * JSON string is just a character.
+ */
+export function statementsFor(engine: EngineId, text: string): string[] {
+  if (isSql(engine)) return splitStatements(text);
+  return text.trim() ? [text.trim()] : [];
+}
+
+/** The editor's language for what an engine is sent: a command document, a command line, or SQL. */
+export function editorLanguage(engine: EngineId): "json" | "plaintext" | "sql" {
+  return engine === "mongo" ? "json" : engine === "redis" ? "plaintext" : "sql";
+}
+
+/**
+ * A result with the next page of the same query after it.
+ *
+ * Deck reads a result a page at a time, so `total` is only ever the rows on hand, and whether
+ * there are more is the NEW page's to say.
+ */
+export function appendPage(prev: Result, next: Result): Result {
+  const rows = [...prev.rows, ...next.rows];
+  return { columns: prev.columns, rows, total: rows.length, truncated: next.truncated };
+}
+
+/** One saved connection. A file path for SQLite and DuckDB, a url for the others. */
 export interface Connection {
   id: string;
   name: string;
   engine: EngineId;
-  /** File path (sqlite) or a postgres:// | mysql:// url. */
+  /** File path (SQLite, DuckDB) or a postgres:// | mysql:// | mssql:// | redis:// | mongodb:// url. */
   target: string;
   /** Off by default. Per connection, because "safe to write to" is a property of the database. */
   allowWrites: boolean;
@@ -392,21 +330,25 @@ export function throughTunnel(url: string, port: number): string {
   return `${scheme}${userinfo}127.0.0.1:${port}${tail}`;
 }
 
-/** A table with its columns, as both engines report it. */
+/**
+ * A table with its columns, as every engine reports it. For Redis a "table" is a key group (its
+ * name is the MATCH pattern, `user:*`) and for MongoDB a collection with its sampled fields.
+ */
 export interface SchemaTable extends Table {
   columns: Column[];
 }
 
 /**
- * What the UI drives. Both engines satisfy it, so no component branches on the engine.
+ * What the UI drives. Every engine satisfies it, so no component holds a connection itself.
  *
- * `close` matters more than it looks: a sqlite source holds a wasm heap copy of the file, and a
- * server source holds real connections on someone else's machine. Neither should outlive the tab.
+ * `close` matters more than it looks: a source holds a file open (which, for DuckDB, locks other
+ * programs out of it) or real connections on someone else's machine. Neither should outlive the tab.
  */
 export interface Source {
   engine: EngineId;
   schema(): Promise<{ tables: SchemaTable[]; foreignKeys: ForeignKeyRef[] }>;
-  run(sql: string, allowWrites: boolean): Promise<Result>;
+  /** `skip` rows are passed over first, which is how the grid loads the next page. */
+  run(sql: string, allowWrites: boolean, skip?: number): Promise<Result>;
   rowCount(table: string): Promise<number>;
   close(): Promise<void>;
 }
@@ -422,21 +364,42 @@ export interface ForeignKeyRef {
 /**
  * Quote an identifier for one engine.
  *
- * MySQL uses backticks; the other two use double quotes, which is the SQL standard. Doubling the
- * quote character is what makes the escaping total rather than nearly right.
+ * MySQL uses backticks and SQL Server brackets; the rest use double quotes, the SQL standard.
+ * Doubling the closing quote character is what makes the escaping total rather than nearly right.
+ * Redis and MongoDB have no identifiers to quote, so a name comes back as it is.
  */
 export function quoteFor(engine: EngineId, name: string): string {
-  return engine === "mysql"
-    ? `\`${name.replace(/`/g, "``")}\``
-    : `"${name.replace(/"/g, '""')}"`;
+  if (engine === "mysql") return `\`${name.replace(/`/g, "``")}\``;
+  if (engine === "mssql") return `[${name.replace(/]/g, "]]")}]`;
+  if (!isSql(engine)) return name;
+  return `"${name.replace(/"/g, '""')}"`;
 }
 
-/** The default query for a table, in one engine's dialect. */
+/** A word of a Redis command line, quoted the way Deck splits one when it has to be. */
+function redisWord(w: string): string {
+  return /^[^\s"'\\]+$/.test(w) ? w : `"${w.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * The default query for a table, in one engine's language: enough rows to see the shape.
+ *
+ * Redis lists the group's keys, its name being their MATCH pattern; MongoDB finds 200 documents.
+ */
 export function previewFor(engine: EngineId, table: string): string {
+  if (engine === "mssql") return `select top 200 * from ${quoteFor(engine, table)};`;
+  if (engine === "redis") return `SCAN 0 MATCH ${redisWord(table)}`;
+  if (engine === "mongo") return JSON.stringify({ find: table, limit: 200 });
   return `select * from ${quoteFor(engine, table)} limit 200;`;
 }
 
-/** The query behind a foreign-key click, in one engine's dialect. */
+/** The query that counts a table's rows, or null where there is no such thing (a Redis group). */
+export function countFor(engine: EngineId, table: string): string | null {
+  if (engine === "redis") return null;
+  if (engine === "mongo") return JSON.stringify({ count: table });
+  return `select count(*) from ${quoteFor(engine, table)}`;
+}
+
+/** The query behind a foreign-key click, in one engine's dialect. SQL engines only. */
 export function lookupFor(engine: EngineId, fk: ForeignKeyRef, value: unknown): string {
   const literal = typeof value === "number"
     ? String(value)
@@ -453,6 +416,18 @@ export function lookupFor(engine: EngineId, fk: ForeignKeyRef, value: unknown): 
 
 /** Why a result cannot be edited, or null if it can. */
 export type EditBlock = string | null;
+
+/**
+ * Why no result from this engine can be edited in the grid, or null when one can.
+ *
+ * Redis and MongoDB rows are a reply shaped into a table, not a table's rows: there is no key
+ * column to name a row by and no UPDATE to write. A command does the change instead.
+ */
+export function engineEditBlock(engine: EngineId): EditBlock {
+  if (engine === "redis") return "A Redis reply is read here, not edited. Change a key with a command, such as SET or HSET.";
+  if (engine === "mongo") return "MongoDB documents are read here, not edited. Change them with a command, such as update.";
+  return null;
+}
 
 /**
  * Whether a result's rows can be written back, and why not when they cannot.
@@ -587,4 +562,277 @@ export function singleTable(sql: string): string | null {
   const name = from[1].replace(/^["`\[]|["`\]]$/g, "");
   // A schema-qualified name keeps only the table part, which is what information_schema lists.
   return name.includes(".") ? (name.split(".").pop() ?? null) : name;
+}
+
+// ---- export ----------------------------------------------------------------------------------
+//
+// What the Export menu copies or saves. The rows on screen, like the CSV: a capped result exports
+// the rows the grid shows, and the menu says so, rather than quietly disagreeing with the count.
+
+/** A result as a JSON array of row objects, keyed by column name. */
+export function toJson(result: Result): string {
+  // Deck hands every cell over as JSON already (a BLOB as its "BLOB (n bytes)" summary), so the
+  // values go out as they came in.
+  return JSON.stringify(
+    result.rows.map((r) => Object.fromEntries(result.columns.map((c, i) => [c, r[i] ?? null]))),
+    null,
+    2,
+  );
+}
+
+/**
+ * A stored value as a literal, exactly.
+ *
+ * Not `literal`, which reads what a person typed into a cell: there "" means NULL and "42" means
+ * the number. An exported value came out of the database, so a string stays a string, empty
+ * included, and only a real null is NULL.
+ */
+function exactLiteral(engine: EngineId, v: unknown): string {
+  if (v === null || v === undefined) return "null";
+  if (typeof v === "number") return String(v);
+  // SQL Server has no boolean literal: a bit column takes 1 and 0.
+  if (typeof v === "boolean") return engine === "mssql" ? (v ? "1" : "0") : v ? "true" : "false";
+  return strFor(engine, String(v));
+}
+
+/**
+ * One INSERT per row, into `table`.
+ *
+ * Every column is named and every value sent, unlike `insertStatement`: that one builds a new row
+ * from a form, where a blank field should fall to the column's default, and an export has to put
+ * back exactly what was read.
+ */
+export function toInserts(engine: EngineId, table: string, result: Result): string {
+  const cols = result.columns.map((c) => quoteFor(engine, c)).join(", ");
+  const into = `insert into ${quoteFor(engine, table)} (${cols}) values`;
+  return result.rows
+    .map((r) => `${into} (${r.map((v) => exactLiteral(engine, v)).join(", ")});`)
+    .join("\n");
+}
+
+/**
+ * A value pretty-printed as JSON, or null when it is not JSON.
+ *
+ * Only an object or an array counts: `42` and `"x"` are valid JSON too, but showing them
+ * "formatted" changes nothing, and a text column of numbers is not a JSON column.
+ */
+export function prettyJson(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.trim();
+  if (!/^[[{]/.test(s)) return null;
+  try {
+    return JSON.stringify(JSON.parse(s), null, 2);
+  } catch {
+    return null;
+  }
+}
+
+// ---- formatting ------------------------------------------------------------------------------
+
+/**
+ * SQL laid out by sql-formatter, in the engine's own dialect.
+ *
+ * The dialect matters beyond taste: MySQL's backticks, SQL Server's [brackets] and Postgres's `::`
+ * casts are tokens only in their own dialect, and formatting one as plain SQL splits them apart.
+ * Only the dialects named here are imported, so the others the package knows stay out of
+ * plugin.js. Throws on SQL the formatter cannot parse, and for Redis and MongoDB, which are not
+ * SQL; the UI offers Format only where `isSql` says so.
+ */
+export function formatSql(engine: EngineId, sql: string): string {
+  const dialect = { sqlite: sqliteDialect, duckdb, postgres: postgresql, mysql, mssql: transactsql }[engine as string];
+  if (!dialect) throw new Error(`${engine} is not SQL`);
+  return formatDialect(sql, { dialect });
+}
+
+// ---- explain ---------------------------------------------------------------------------------
+
+/**
+ * A statement as each engine's plan for it.
+ *
+ * SQLite's plain EXPLAIN is its bytecode, which says nothing to a reader; QUERY PLAN is the tree
+ * of scans and searches. Plain EXPLAIN (never ANALYZE) on the servers plans without executing, so
+ * an explained write is still not run. A statement that is already an EXPLAIN is left as it is.
+ *
+ * Null where there is no such prefix: SQL Server shows a plan only through SET SHOWPLAN, a session
+ * switch that has to be a batch of its own, and Redis and MongoDB are not SQL.
+ */
+export function explainFor(engine: EngineId, sql: string): string | null {
+  if (engine === "mssql" || !isSql(engine)) return null;
+  const s = sql.trim().replace(/;+\s*$/, "");
+  if (/^explain\b/i.test(stripLeading(s))) return s;
+  return `${engine === "sqlite" ? "explain query plan" : "explain"} ${s}`;
+}
+
+// ---- structure -------------------------------------------------------------------------------
+//
+// What the Structure view reads beyond the schema the sidebar already holds: column defaults and
+// indexes. Each is one read-only query per engine, aliased to the same column names so one parser
+// serves all three.
+
+/**
+ * A string literal for one engine. MySQL also treats a backslash as an escape by default, and SQL
+ * Server's N'' keeps text outside the database's code page intact.
+ */
+function strFor(engine: EngineId, s: string): string {
+  const body = (engine === "mysql" ? s.replace(/\\/g, "\\\\") : s).replace(/'/g, "''");
+  return engine === "mssql" ? `N'${body}'` : `'${body}'`;
+}
+
+export interface IndexInfo {
+  name: string;
+  columns: string[];
+  unique: boolean;
+  /** The engine's own CREATE INDEX, where it keeps one (Postgres). */
+  definition: string;
+}
+
+/**
+ * The queries behind the Structure view, each null where the engine has no such thing.
+ *
+ * `defaults` returns (name, dflt). `indexes` returns (name, uniq, col), a row per indexed column;
+ * or (name, definition) on Postgres, whose pg_indexes holds the whole definition, and DuckDB,
+ * whose duckdb_indexes() does too; or MongoDB's listIndexes documents (name, key, unique).
+ * `create` returns the table's DDL as its second column where the engine can give it: MySQL only,
+ * since SQLite's and DuckDB's are already in the schema and Postgres and SQL Server keep none.
+ * A Redis key group has no defaults, indexes or DDL at all.
+ */
+export function structureQueries(engine: EngineId, table: string): {
+  defaults: string | null; indexes: string | null; create: string | null;
+} {
+  if (engine === "redis") return { defaults: null, indexes: null, create: null };
+  if (engine === "mongo") return { defaults: null, indexes: JSON.stringify({ listIndexes: table }), create: null };
+  const t = strFor(engine, table);
+  if (engine === "duckdb") {
+    return {
+      defaults: `select column_name as name, column_default as dflt from information_schema.columns
+        where table_schema = current_schema() and table_name = ${t}`,
+      indexes: `select index_name as name, is_unique as uniq, sql as definition from duckdb_indexes()
+        where schema_name = current_schema() and table_name = ${t} order by index_name`,
+      create: null,
+    };
+  }
+  if (engine === "mssql") {
+    return {
+      defaults: `select column_name as name, column_default as dflt from information_schema.columns
+        where table_schema = schema_name() and table_name = ${t}`,
+      // sys.indexes rather than information_schema, which has no indexes at all. A heap's row
+      // (type 0) has no name and no columns, and included columns are not part of the key.
+      indexes: `select i.name as name, i.is_unique as uniq, c.name as col
+        from sys.indexes i
+        join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id
+        join sys.columns c on c.object_id = ic.object_id and c.column_id = ic.column_id
+        where i.object_id = object_id(quotename(schema_name()) + '.' + quotename(${t}))
+          and i.type > 0 and ic.is_included_column = 0
+        order by i.name, ic.key_ordinal`,
+      create: null,
+    };
+  }
+  if (engine === "sqlite") {
+    return {
+      defaults: `select name, dflt_value as dflt from pragma_table_info(${t})`,
+      // Table-valued pragmas, so every index and its columns come back from one query.
+      indexes: `select il.name as name, il."unique" as uniq, ii.name as col
+        from pragma_index_list(${t}) as il, pragma_index_info(il.name) as ii
+        order by il.name, ii.seqno`,
+      create: null,
+    };
+  }
+  if (engine === "postgres") {
+    return {
+      defaults: `select column_name as name, column_default as dflt from information_schema.columns
+        where table_schema = current_schema() and table_name = ${t}`,
+      indexes: `select indexname as name, indexdef as definition from pg_indexes
+        where schemaname = current_schema() and tablename = ${t} order by indexname`,
+      create: null,
+    };
+  }
+  return {
+    defaults: `select column_name as name, column_default as dflt from information_schema.columns
+      where table_schema = database() and table_name = ${t}`,
+    indexes: `select index_name as name, non_unique = 0 as uniq, column_name as col
+      from information_schema.statistics
+      where table_schema = database() and table_name = ${t}
+      order by index_name, seq_in_index`,
+    create: `show create table ${quoteFor(engine, table)}`,
+  };
+}
+
+/** Column name to its default, from the `defaults` query. A column with none is left out. */
+export function parseDefaults(result: Result): Map<string, string> {
+  const n = result.columns.indexOf("name");
+  const d = result.columns.indexOf("dflt");
+  const out = new Map<string, string>();
+  for (const r of result.rows) {
+    if (r[d] !== null && r[d] !== undefined) out.set(String(r[n]), String(r[d]));
+  }
+  return out;
+}
+
+/** Indexes from the `indexes` query, one per name, with its columns in key order. */
+export function parseIndexes(result: Result): IndexInfo[] {
+  const at = (c: string) => result.columns.indexOf(c);
+  // MongoDB's listIndexes cannot alias its fields: `unique` and `key` are its own names.
+  const [n, c, def, key] = [at("name"), at("col"), at("definition"), at("key")];
+  const u = at("uniq") >= 0 ? at("uniq") : at("unique");
+  const out = new Map<string, IndexInfo>();
+  for (const r of result.rows) {
+    const name = String(r[n]);
+    let ix = out.get(name);
+    if (!ix) {
+      const definition = def >= 0 ? String(r[def] ?? "") : "";
+      ix = {
+        name,
+        columns: [],
+        // A flag (1, true or "1"); Postgres says it in the definition instead.
+        unique: u >= 0 ? r[u] === 1 || r[u] === true || r[u] === "1" : /^create unique/i.test(definition),
+        definition,
+      };
+      out.set(name, ix);
+    }
+    if (c >= 0 && r[c] !== null && r[c] !== undefined) ix.columns.push(String(r[c]));
+    // MongoDB: the key document, as compact JSON, names the fields in order (`{"a":1,"b":-1}`).
+    if (key >= 0 && typeof r[key] === "string") {
+      try { ix.columns = Object.keys(JSON.parse(r[key] as string)); } catch { /* shown without columns */ }
+    }
+    // Postgres: the columns are the last parenthesised list, `... USING btree (a, b)`.
+    if (def >= 0 && !ix.columns.length) {
+      const m = /\(([^()]*)\)[^()]*$/.exec(ix.definition);
+      if (m) ix.columns = m[1].split(",").map((x) => x.trim()).filter(Boolean);
+    }
+  }
+  return [...out.values()];
+}
+
+// ---- query tabs ------------------------------------------------------------------------------
+
+/** One query tab: its name and the SQL in it. */
+export interface QueryTab {
+  id: string;
+  name: string;
+  sql: string;
+}
+
+/**
+ * The tabs from a saved config, whatever its age.
+ *
+ * Before tabs there was one buffer, `sql`. A config from then becomes ONE tab holding exactly that
+ * text, so upgrading never loses a query; a config with no text at all still gets an empty tab,
+ * since the editor needs something to show.
+ */
+export function migrateTabs(saved: { tabs?: QueryTab[]; activeTab?: string; sql?: string }): {
+  tabs: QueryTab[]; activeTab: string;
+} {
+  const tabs = Array.isArray(saved.tabs) && saved.tabs.length
+    ? saved.tabs
+    : [{ id: "t1", name: "Query 1", sql: typeof saved.sql === "string" ? saved.sql : "" }];
+  const activeTab = tabs.some((t) => t.id === saved.activeTab) ? saved.activeTab! : tabs[0].id;
+  return { tabs, activeTab };
+}
+
+/** The lowest "Query N" not already open, so a new tab never repeats a name. */
+export function nextTabName(tabs: QueryTab[]): string {
+  const taken = new Set(tabs.map((t) => t.name));
+  let n = 1;
+  while (taken.has(`Query ${n}`)) n++;
+  return `Query ${n}`;
 }

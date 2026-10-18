@@ -1,18 +1,15 @@
 // node db.check.mjs
 //
-// The browser's logic, against a real database rather than a fixture. Two things here are worth
-// more than the rest: the statement splitter, which is wrong the moment a semicolon appears
-// inside a string literal, and isReadOnly, which is a guard — a write it fails to recognise is
-// a write that runs against the user's file.
+// The plugin's logic, in node with no Deck around it. Two things here are worth more than the
+// rest: the statement splitter, which is wrong the moment a semicolon appears inside a string
+// literal, and isReadOnly, which is a guard — a write it fails to recognise is a write that runs
+// against the user's database.
 //
-// Wally's database is used as the sample because it is already on this machine and has a real
-// schema. If it is absent the schema half skips; the pure string functions still run, since they
-// need no database at all.
+// Where SQL has to be proven to run, it runs against node's own SQLite (node:sqlite, in memory),
+// so no sample database needs to be on the machine.
 import assert from "node:assert";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { build } from "esbuild";
-import initSqlJs from "sql.js";
 
 const out = await build({
   entryPoints: ["src/db.ts"],
@@ -72,10 +69,6 @@ for (const sql of [
 assert.equal(q.isReadOnly("frobnicate the database"), false, "unknown statements are not reads");
 assert.equal(q.isReadOnly(""), false, "empty is not a read");
 assert.equal(q.isReadOnly("-- only a comment"), false, "a comment alone is not a read");
-
-// ---- identifier quoting --------------------------------------------------------------------
-assert.equal(q.quoteIdent("order"), '"order"', "a keyword table name is quoted");
-assert.equal(q.quoteIdent('we"ird'), '"we""ird"', "an embedded quote is doubled");
 
 // ---- cell rendering ------------------------------------------------------------------------
 assert.deepEqual(q.cell(null), { text: "NULL", kind: "null" });
@@ -151,18 +144,6 @@ assert.ok(!long.some((h) => h.sql === "select 0"), "oldest dropped");
 assert.equal(q.textToRun("select 1; select 2", ""), "select 1; select 2", "no selection runs all");
 assert.equal(q.textToRun("select 1; select 2", "select 2"), "select 2", "a selection runs alone");
 assert.equal(q.textToRun("select 1", "   "), "select 1", "a whitespace selection is no selection");
-
-// ---- foreign keys ------------------------------------------------------------------------------
-assert.equal(
-  q.lookupQuery({ column: "category_id", table: "categories", toColumn: "id" }, 3),
-  'select * from "categories" where "id" = 3;',
-  "a numeric key is interpolated bare",
-);
-assert.equal(
-  q.lookupQuery({ column: "code", table: "t", toColumn: "k" }, "it's"),
-  `select * from "t" where "k" = 'it''s';`,
-  "a text key is quoted and its quotes doubled",
-);
 
 // ---- dialects ----------------------------------------------------------------------------
 // MySQL quotes with backticks, the other two with the standard double quote. Getting this wrong
@@ -320,70 +301,234 @@ assert.equal(
   "insert into `t` (`a`) values (1);",
 );
 
-// ---- against a real database -----------------------------------------------------------------
-const DB = join(process.env.APPDATA ?? "", "Deck", "wallet", "wallet_profile_1.db");
-if (!existsSync(DB)) {
-  console.log(`db: ok (string logic only — no database at ${DB})`);
-  process.exit(0);
+// ---- the statement under the cursor -------------------------------------------------------------
+{
+  const s = "select 1;\nselect 'a;b';\n\n";
+  assert.equal(q.statementAt(s, 3), "select 1");
+  assert.equal(q.statementAt(s, 9), "select 1", "right after the ; is still the statement it ends");
+  assert.equal(q.statementAt(s, 14), "select 'a;b'", "a ; inside a literal does not split");
+  assert.equal(q.statementAt(s, s.length), "select 'a;b'", "trailing blank space falls to the last");
+  assert.equal(q.statementAt("  ", 1), "", "nothing to run");
 }
 
-const SQL = await initSqlJs();
-const db = new SQL.Database(readFileSync(DB));
+// ---- formatting -----------------------------------------------------------------------------
+assert.equal(q.formatSql("sqlite", "select a,b from t where a=1"), "select\n  a,\n  b\nfrom\n  t\nwhere\n  a = 1");
+assert.match(q.formatSql("mysql", "select `a b` from t"), /`a b`/, "mysql's backticks survive");
+assert.match(q.formatSql("postgres", "select x::int from t"), /x::int/, "a postgres cast stays whole");
+assert.throws(() => q.formatSql("sqlite", "select 'unclosed"), "unparseable SQL throws, not mangles");
 
-const ts = q.tables(db);
-assert.ok(ts.length > 0, "the database has tables");
-assert.ok(ts.every((t) => t.name && !t.name.startsWith("sqlite_")), "internal tables are hidden");
-assert.ok(ts.some((t) => t.name === "transactions"), "Wally's transactions table is listed");
+// ---- explain --------------------------------------------------------------------------------
+assert.equal(q.explainFor("sqlite", "select 1;"), "explain query plan select 1");
+assert.equal(q.explainFor("postgres", " select 1 "), "explain select 1");
+assert.equal(q.explainFor("mysql", "select 1"), "explain select 1");
+assert.equal(q.explainFor("postgres", "EXPLAIN select 1"), "EXPLAIN select 1", "not explained twice");
+assert.ok(q.isReadOnly(q.explainFor("sqlite", "delete from t")), "an explained write is a read");
 
-const cols = q.columns(db, "transactions");
-assert.ok(cols.length > 0, "transactions has columns");
-assert.ok(cols.some((c) => c.pk), "and a primary key");
-assert.ok(cols.every((c) => typeof c.name === "string" && typeof c.notNull === "boolean"));
-
-assert.ok(q.rowCount(db, "transactions") > 0, "and rows");
-
-// A result carries its columns even when it matched nothing, and never reports NaN.
-const empty = q.run(db, "select * from transactions where 1 = 0");
-assert.equal(empty.total, 0);
-assert.equal(empty.truncated, false);
-
-const some = q.run(db, "select id from transactions limit 5");
-assert.equal(some.rows.length, 5);
-assert.deepEqual(some.columns, ["id"]);
-
-// The cap truncates the rows but reports the true total, so the UI can say "showing N of M".
-const capped = q.run(db, `select 1 from transactions, transactions limit ${q.ROW_CAP + 50}`);
-if (capped.total > q.ROW_CAP) {
-  assert.equal(capped.rows.length, q.ROW_CAP, "rows are capped");
-  assert.ok(capped.truncated && capped.total > capped.rows.length, "the true total is kept");
+// ---- export ---------------------------------------------------------------------------------
+{
+  const r = { columns: ["id", "name", "note", "b"], rows: [[1, "it's", null, ""], [2, "", "x", "0"]], total: 2, truncated: false };
+  assert.deepEqual(JSON.parse(q.toJson(r)), [
+    { id: 1, name: "it's", note: null, b: "" },
+    { id: 2, name: "", note: "x", b: "0" },
+  ], "JSON keeps null, empty and numeric-looking strings as they are");
+  assert.equal(
+    q.toInserts("postgres", "t", r),
+    `insert into "t" ("id", "name", "note", "b") values (1, 'it''s', null, '');\n`
+    + `insert into "t" ("id", "name", "note", "b") values (2, '', 'x', '0');`,
+    "an export keeps '' as '' and '0' as a string, unlike a typed cell",
+  );
+  assert.equal(
+    q.toInserts("mysql", "t", { columns: ["p"], rows: [["a\\b"]], total: 1, truncated: false }),
+    "insert into `t` (`p`) values ('a\\\\b');",
+    "mysql doubles a backslash",
+  );
+  assert.equal(q.toInserts("sqlite", "t", { columns: ["a"], rows: [], total: 0, truncated: false }), "");
 }
 
-// A bad query throws with something worth showing, rather than returning empty.
-assert.throws(() => q.run(db, "select * from no_such_table"), /no such table/i);
+// ---- the value viewer's JSON ------------------------------------------------------------------
+assert.equal(q.prettyJson('{"a":[1,2]}'), '{\n  "a": [\n    1,\n    2\n  ]\n}');
+assert.equal(q.prettyJson("42"), null, "a bare number is not shown as JSON");
+assert.equal(q.prettyJson("{not json"), null);
+assert.equal(q.prettyJson(null), null);
 
-// previewQuery must actually run against every table in the database, including any whose name
-// needs quoting — which is the only thing quoteIdent is there for.
-for (const t of ts) q.run(db, q.previewQuery(t.name));
-
-console.log(`db: ok (${ts.length} tables, ${cols.length} columns on transactions)`);
-
-// ---- foreign keys, as actually declared --------------------------------------------------------
-// Wally declares them, so the browser has real links to follow.
-const fks = q.foreignKeys(db, "transactions");
-assert.ok(fks.length >= 2, "transactions declares foreign keys");
-const cat = fks.find((f) => f.column === "category_id");
-assert.ok(cat && cat.table === "categories" && cat.toColumn === "id",
-  "category_id points at categories.id");
-
-// Following one must produce a query that actually runs and finds the row.
-const anyTxn = q.run(db, "select category_id from transactions where category_id is not null limit 1");
-if (anyTxn.rows.length) {
-  const found = q.run(db, q.lookupQuery(cat, anyTxn.rows[0][0]));
-  assert.equal(found.total, 1, "following a foreign key finds exactly one row");
+// ---- structure --------------------------------------------------------------------------------
+{
+  const pg = q.structureQueries("postgres", "o'brien");
+  assert.match(pg.indexes, /tablename = 'o''brien'/, "the table name is a literal, quote doubled");
+  assert.equal(pg.create, null);
+  assert.equal(q.structureQueries("mysql", "we`ird").create, "show create table `we``ird`");
+  const ix = q.parseIndexes({
+    columns: ["name", "definition"],
+    rows: [
+      ["t_pkey", "CREATE UNIQUE INDEX t_pkey ON public.t USING btree (id)"],
+      ["t_ab", "CREATE INDEX t_ab ON public.t USING btree (a, b)"],
+    ],
+    total: 2, truncated: false,
+  });
+  assert.deepEqual(ix.map((i) => [i.name, i.unique, i.columns]), [["t_pkey", true, ["id"]], ["t_ab", false, ["a", "b"]]]);
+  const my = q.parseIndexes({
+    columns: ["name", "uniq", "col"],
+    rows: [["PRIMARY", 1, "id"], ["ab", 0, "a"], ["ab", 0, "b"]],
+    total: 3, truncated: false,
+  });
+  assert.deepEqual(my.map((i) => [i.name, i.unique, i.columns]), [["PRIMARY", true, ["id"]], ["ab", false, ["a", "b"]]]);
 }
 
-// A table with no declared keys reports none rather than throwing.
-assert.deepEqual(q.foreignKeys(db, "categories"), [], "categories declares none");
+// A query against a real (in-memory) SQLite, shaped as Deck's db_query shapes a result.
+const mem = new DatabaseSync(":memory:");
+const runMem = (sql) => {
+  const st = mem.prepare(sql);
+  const columns = st.columns().map((c) => c.name);
+  const rows = st.all().map((r) => columns.map((c) => r[c]));
+  return { columns, rows, total: rows.length, truncated: false };
+};
 
+// The structure queries: the table-valued pragmas are the part only a real engine can confirm.
+{
+  mem.exec(`create table "o'k" (id integer primary key, a text not null default 'x', b int);
+    create unique index ix_ab on "o'k" (a, b); create index ix_b on "o'k" (b);`);
+  const sq = q.structureQueries("sqlite", "o'k");
+  const d = q.parseDefaults(runMem(sq.defaults));
+  assert.equal(d.get("a"), "'x'", "sqlite reports the default as written");
+  assert.equal(d.has("b"), false, "a column with no default is left out");
+  const ixs = q.parseIndexes(runMem(sq.indexes));
+  assert.deepEqual(ixs.map((i) => [i.name, i.unique, i.columns]), [["ix_ab", true, ["a", "b"]], ["ix_b", false, ["b"]]]);
+}
 
-console.log("db: sort, history, selection and foreign keys ok");
+// ---- query tabs --------------------------------------------------------------------------------
+// The one buffer before tabs must come through whole: it is the user's only copy of that query.
+assert.deepEqual(q.migrateTabs({ sql: "select 1" }), {
+  tabs: [{ id: "t1", name: "Query 1", sql: "select 1" }], activeTab: "t1",
+}, "an old config's sql becomes one tab");
+assert.deepEqual(q.migrateTabs({}).tabs.map((t) => t.sql), [""], "no sql still gives one tab");
+{
+  const tabs = [{ id: "a", name: "A", sql: "1" }, { id: "b", name: "B", sql: "2" }];
+  assert.deepEqual(q.migrateTabs({ tabs, activeTab: "b", sql: "old" }), { tabs, activeTab: "b" }, "tabs win over a stale sql");
+  assert.equal(q.migrateTabs({ tabs, activeTab: "gone" }).activeTab, "a", "a missing active tab falls to the first");
+  assert.equal(q.migrateTabs({ tabs: [], sql: "x" }).tabs[0].sql, "x", "an empty tab list is not a migration");
+}
+assert.equal(q.nextTabName([{ id: "1", name: "Query 1", sql: "" }, { id: "3", name: "Query 3", sql: "" }]), "Query 2");
+assert.equal(q.nextTabName([]), "Query 1");
+
+// ---- engines --------------------------------------------------------------------------------
+const SQL_ENGINES = ["sqlite", "duckdb", "postgres", "mysql", "mssql"];
+for (const e of SQL_ENGINES) assert.ok(q.isSql(e), `${e} is SQL`);
+assert.equal(q.isSql("redis"), false);
+assert.equal(q.isSql("mongo"), false);
+assert.ok(q.isFile("sqlite") && q.isFile("duckdb") && !q.isFile("postgres") && !q.isFile("mongo"));
+
+// A file is opened by Deck as `<scheme>:<absolute path>`; a server's url goes as it is.
+assert.equal(q.connectUrl("sqlite", "C:\\data\\a.db"), "sqlite:C:\\data\\a.db");
+assert.equal(q.connectUrl("duckdb", "D:/x.duckdb"), "duckdb:D:/x.duckdb");
+assert.equal(q.connectUrl("redis", "redis://h:6379/0"), "redis://h:6379/0");
+
+// Quoting: SQL Server brackets (a ] doubled), DuckDB the standard double quote.
+assert.equal(q.quoteFor("mssql", "order"), "[order]");
+assert.equal(q.quoteFor("mssql", "a]b"), "[a]]b]", "a closing bracket is doubled");
+assert.equal(q.quoteFor("duckdb", 'we"ird'), '"we""ird"');
+assert.equal(q.quoteFor("redis", "user:*"), "user:*", "Redis has nothing to quote");
+
+// Previews, one per engine's language.
+assert.equal(q.previewFor("mssql", "t"), "select top 200 * from [t];");
+assert.equal(q.previewFor("duckdb", "t"), 'select * from "t" limit 200;');
+assert.equal(q.previewFor("redis", "user:*"), "SCAN 0 MATCH user:*", "a key group's name is its MATCH pattern");
+assert.equal(q.previewFor("redis", 'my key*'), 'SCAN 0 MATCH "my key*"', "a pattern with a space is quoted");
+assert.equal(q.previewFor("redis", 'a"b'), 'SCAN 0 MATCH "a\\"b"', "and a quote in it escaped");
+assert.deepEqual(JSON.parse(q.previewFor("mongo", "users")), { find: "users", limit: 200 });
+assert.equal(Object.keys(JSON.parse(q.previewFor("mongo", "users")))[0], "find", "the command name comes first");
+
+assert.equal(q.countFor("redis", "user:*"), null, "a Redis group has no count query");
+assert.deepEqual(JSON.parse(q.countFor("mongo", "users")), { count: "users" });
+assert.equal(q.countFor("mssql", "t"), "select count(*) from [t]");
+
+assert.equal(
+  q.lookupFor("mssql", { table: "o", column: "c", refTable: "customers", refColumn: "id" }, 7),
+  "select * from [customers] where [id] = 7;",
+);
+
+// What one run sends: SQL is split, a Redis or MongoDB command is one thing whatever it holds.
+assert.deepEqual(q.statementsFor("sqlite", "select 1; select 2"), ["select 1", "select 2"]);
+assert.deepEqual(q.statementsFor("mongo", ' {"find": "a;b"} '), ['{"find": "a;b"}'], "a ; in JSON does not split");
+assert.deepEqual(q.statementsFor("redis", "SET a 1; GET a"), ["SET a 1; GET a"]);
+assert.deepEqual(q.statementsFor("redis", "   "), []);
+
+assert.equal(q.editorLanguage("mongo"), "json");
+assert.equal(q.editorLanguage("redis"), "plaintext");
+assert.equal(q.editorLanguage("mssql"), "sql");
+
+// Editing is SQL only, and says why not.
+for (const e of SQL_ENGINES) assert.equal(q.engineEditBlock(e), null);
+assert.match(q.engineEditBlock("redis") ?? "", /command/);
+assert.match(q.engineEditBlock("mongo") ?? "", /command/);
+
+// Explain: unavailable on SQL Server, Redis and MongoDB; plain EXPLAIN on DuckDB.
+assert.equal(q.explainFor("mssql", "select 1"), null);
+assert.equal(q.explainFor("redis", "GET a"), null);
+assert.equal(q.explainFor("mongo", "{}"), null);
+assert.equal(q.explainFor("duckdb", "select 1;"), "explain select 1");
+
+// Format: each SQL engine in its own dialect; the others are not SQL.
+assert.match(q.formatSql("mssql", "select [a b] from t"), /\[a b\]/, "SQL Server's brackets survive");
+assert.match(q.formatSql("duckdb", "select x::int from t"), /x::int/);
+assert.throws(() => q.formatSql("redis", "GET a"), /not SQL/);
+
+// Export on SQL Server: N'' strings and bits as 1 and 0.
+assert.equal(
+  q.toInserts("mssql", "t", { columns: ["n", "b"], rows: [["it's", true]], total: 1, truncated: false }),
+  "insert into [t] ([n], [b]) values (N'it''s', 1);",
+);
+
+// Structure on the engines that differ.
+{
+  const ms = q.structureQueries("mssql", "o'k");
+  assert.match(ms.indexes, /quotename\(N'o''k'\)/, "the table name is a literal, quote doubled");
+  assert.equal(ms.create, null);
+  const dk = q.structureQueries("duckdb", "t");
+  assert.match(dk.indexes, /duckdb_indexes\(\)/);
+  assert.deepEqual(q.structureQueries("redis", "user:*"), { defaults: null, indexes: null, create: null });
+  const mg = q.structureQueries("mongo", "users");
+  assert.deepEqual(JSON.parse(mg.indexes), { listIndexes: "users" });
+  assert.equal(mg.defaults, null);
+  // MongoDB's listIndexes: the key document names the fields, `unique` is its own field.
+  const mix = q.parseIndexes({
+    columns: ["v", "key", "name", "unique"],
+    rows: [[2, '{"_id":1}', "_id_", null], [2, '{"email":1,"at":-1}', "email_1_at_-1", true]],
+    total: 2, truncated: false,
+  });
+  assert.deepEqual(mix.map((i) => [i.name, i.unique, i.columns]), [["_id_", false, ["_id"]], ["email_1_at_-1", true, ["email", "at"]]]);
+  // DuckDB: a flag and a definition, the columns read from the definition.
+  const dix = q.parseIndexes({
+    columns: ["name", "uniq", "definition"],
+    rows: [["ix", false, "CREATE INDEX ix ON t(a, b);"]], total: 1, truncated: false,
+  });
+  assert.deepEqual(dix.map((i) => [i.name, i.unique, i.columns]), [["ix", false, ["a", "b"]]]);
+}
+
+// ---- paging ---------------------------------------------------------------------------------
+{
+  const first = { columns: ["a"], rows: [[1], [2]], total: 2, truncated: true };
+  const more = q.appendPage(first, { columns: ["a"], rows: [[3]], total: 1, truncated: false });
+  assert.deepEqual(more.rows, [[1], [2], [3]], "the next page goes after the rows on hand");
+  assert.equal(more.total, 3);
+  assert.equal(more.truncated, false, "whether more exist is the new page's to say");
+  assert.deepEqual(first.rows, [[1], [2]], "the earlier result is not changed");
+}
+
+// ---- the generated SQL runs -----------------------------------------------------------------
+// On a real SQLite, against names that need quoting: a preview, a count and a foreign-key follow.
+{
+  mem.exec(`create table "we""ird" (id integer primary key, note text);
+    insert into "we""ird" (note) values ('a'), ('it''s');`);
+  assert.equal(runMem(q.previewFor("sqlite", 'we"ird')).rows.length, 2);
+  assert.equal(runMem(q.countFor("sqlite", 'we"ird')).rows[0][0], 2);
+  const fk = { table: "x", column: "y", refTable: 'we"ird', refColumn: "note" };
+  assert.equal(runMem(q.lookupFor("sqlite", fk, "it's")).rows.length, 1, "a text key with a quote finds its row");
+  // An exported INSERT puts the rows back exactly.
+  const r = runMem(`select * from "we""ird"`);
+  mem.exec(`delete from "we""ird"`);
+  mem.exec(q.toInserts("sqlite", 'we"ird', r));
+  assert.deepEqual(runMem(`select * from "we""ird"`).rows, r.rows);
+}
+mem.close();
+
+console.log("db: ok");
