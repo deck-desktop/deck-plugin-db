@@ -297,17 +297,20 @@ function blank(engine: EngineId): Connection {
  * server's usual one, the default for an SSH tunnel's far end; `ask` is what the editor takes,
  * said in the empty results pane.
  */
-const ENGINES: { id: EngineId; label: string; hint: string; ext?: string; port?: number; ask: string }[] = [
+// `later`: written for, but not yet offered. Their drivers are moving out of Deck into a helper the
+// plugin downloads on first use, so until that exists Deck cannot open them; the rest of the plugin
+// already handles them, and a connection saved to one still shows by its name.
+const ENGINES: { id: EngineId; label: string; hint: string; ext?: string; port?: number; ask: string; later?: boolean }[] = [
   { id: "sqlite", label: "SQLite", hint: "A .db, .sqlite or .sqlite3 file", ext: "db", ask: "write a query above" },
   { id: "postgres", label: "Postgres", hint: "postgres://user:password@host:5432/database", port: 5432, ask: "write a query above" },
   { id: "mysql", label: "MySQL", hint: "mysql://user:password@host:3306/database", port: 3306, ask: "write a query above" },
   {
-    id: "mssql", label: "SQL Server", port: 1433, ask: "write a query above",
+    id: "mssql", label: "SQL Server", port: 1433, ask: "write a query above", later: true,
     hint: "mssql://user:password@host:1433/database?trustServerCertificate=true",
   },
-  { id: "redis", label: "Redis", hint: "redis://host:6379/0", port: 6379, ask: "type a command above, such as GET user:1 or HGETALL user:1" },
+  { id: "redis", label: "Redis", hint: "redis://host:6379/0", port: 6379, later: true, ask: "type a command above, such as GET user:1 or HGETALL user:1" },
   {
-    id: "mongo", label: "MongoDB", hint: "mongodb://user:password@host:27017/database", port: 27017,
+    id: "mongo", label: "MongoDB", hint: "mongodb://user:password@host:27017/database", port: 27017, later: true,
     ask: `type a command above as JSON, such as {"find": "users", "filter": {}}`,
   },
 ];
@@ -422,7 +425,7 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
           style={{ background: "var(--bg-card-glass)" }}>
           {/* The engine, as one group of buttons with the chosen one selected. */}
           <div className="mb-3 inline-flex flex-wrap items-center gap-0.5 rounded-lg border border-subtle bg-elev p-0.5">
-            {ENGINES.map((e) => (
+            {ENGINES.filter((e) => !e.later).map((e) => (
               <button key={e.id} onClick={() => setDraft({ ...draft, engine: e.id, target: "" })}
                 aria-pressed={draft.engine === e.id}
                 className={`h-6 rounded-md px-2.5 text-[12px] transition-colors ${
@@ -526,7 +529,7 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
         <div className="flex items-start gap-2.5 rounded-lg border border-subtle bg-elev px-3 py-3 text-[12.5px] leading-relaxed text-text-muted">
           <DatabaseIcon size={16} className="mt-0.5 shrink-0" />
           <div className="flex flex-col items-start gap-2.5">
-            <span>Open a SQLite file, or connect to Postgres, MySQL, SQL Server, Redis or MongoDB, to browse what it holds and run queries. A connection is read-only until you allow writes.</span>
+            <span>Open a SQLite file, or connect to Postgres or MySQL, to browse what it holds and run queries. A connection is read-only until you allow writes.</span>
             <button onClick={() => setDraft(blank("sqlite"))} className={primaryBtn} style={accentFill}>
               <Plus size={14} /> Add a connection
             </button>

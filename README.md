@@ -1,6 +1,6 @@
 # Databases
 
-Browse SQLite files, Postgres, MySQL, SQL Server, Redis and MongoDB, and run queries
+Browse SQLite files, Postgres and MySQL, and run queries
 against them. Every engine is opened by Deck itself (its db_* commands), a file in place: with
 writes allowed, a write is saved to the file.
 
