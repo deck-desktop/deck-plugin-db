@@ -1,38 +1,43 @@
-// Databases — browse a SQLite file, or connect to Postgres or MySQL, and run queries.
+// Databases — open a SQLite or DuckDB file, or connect to Postgres, MySQL, SQL Server, Redis or
+// MongoDB, and run queries.
 //
-// SQLite runs HERE, in wasm: a file is read into memory and queried by sql.js, so nothing is
-// written back to disk even with writes enabled. Postgres and MySQL cannot work that way — a
-// webview has no way to open a TCP socket — so they go through Deck's own db_* commands, which
-// hold the connection in Rust.
+// Every engine goes through Deck's own db_* commands, which hold the connection in Rust: a
+// webview has no way to open a TCP socket, and a database file is better opened in place than
+// read into memory. So a file is the real file, and a write to it, with writes allowed, is a
+// write to the file.
 //
-// The difference stops at `Source` (src/sources.ts). Everything below takes one of those, so no
-// component here asks which engine it is holding: the schema pane, the editor, the grid, the
-// history and the sorting are the same code for all three.
+// The difference stops at `Source` (src/sources.ts) and the per-engine functions in db.ts.
+// Everything below takes a Source, so the schema pane, the editor, the grid, the history and the
+// sorting are the same code for every engine; where one differs (Redis and MongoDB are not SQL),
+// it asks db.ts rather than spelling the engine out.
 //
-// READ-ONLY BY DEFAULT, per connection. For a file that is nearly free, since sql.js edits a
-// private copy. For a server it is the database's own guarantee: the read-only pool sets the
-// flag on every connection, so the SERVER refuses a write rather than a regex here doing it.
+// READ-ONLY BY DEFAULT, per connection, and the database's own guarantee: Rust opens the file
+// read-only or sets the session flag, so the ENGINE refuses a write rather than a regex here
+// doing it (Redis and MongoDB, which have no such flag, by Rust's list of read commands).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Database as DatabaseIcon, Play, FolderOpen, RefreshCw, Table2, Eye, Download, KeyRound, X,
   History, ArrowUp, ArrowDown, Link2, Code2, TextSelect, Plus, Pencil, Trash2, Plug,
-  ChevronRight, Search, Hash, Columns3, Copy, Network,
+  ChevronRight, Search, Hash, Columns3, Copy, Network, TableProperties, PanelRight,
+  WandSparkles, ListTree, Bookmark, BookmarkPlus, ChevronDown,
 } from "lucide-react";
 import { configRead, configWrite, fsWrite, pickFile, pickSavePath } from "../shim/bridge.js";
 import {
-  ConfirmDialog, ContextMenu, Field, TextInput, Toggle, toast, useResize,
-  type ConfirmState, type MenuEntry,
+  ConfirmDialog, ContextMenu, Field, NamePrompt, TabStrip, TextInput, Toggle, toast, useResize,
+  type ConfirmState, type MenuEntry, type NamePromptState,
 } from "../shim/ui.js";
 import { monaco } from "../shim/monaco.js";
 import {
-  cell, deleteStatement, editable, insertStatement, isReadOnly, lookupFor, previewFor,
-  pushHistory, quoteFor, ROW_CAP, singleTable, sortRows, splitStatements, textToRun, toCsv,
-  updateStatement,
+  appendPage, cell, countFor, deleteStatement, editable, editorLanguage, engineEditBlock, explainFor,
+  formatSql, insertStatement, isFile, isReadOnly, isSql, lookupFor, statementsFor,
+  migrateTabs, nextTabName, prettyJson, previewFor, pushHistory, quoteFor, ROW_CAP, singleTable,
+  sortRows, splitStatements, statementAt, textToRun, toCsv, toInserts, toJson, updateStatement,
   type Column, type Connection, type EngineId, type ForeignKeyRef, type HistoryEntry,
-  type Result, type SchemaTable, type Source,
+  type QueryTab, type Result, type SchemaTable, type Source,
 } from "./db";
 import { open } from "./sources";
 import { Diagram } from "./Diagram";
+import { Structure } from "./Structure";
 
 const CFG = "plugin-db";
 
@@ -58,18 +63,52 @@ interface Saved {
   /** Which one to reopen on return, so the tab comes back where it was left. */
   lastId: string;
   /**
-   * The editor's contents, so a query survives leaving the tab.
+   * The query tabs and their SQL, so a query survives leaving the tab.
    *
-   * One buffer for every connection rather than one each: the common case is looking at one
-   * database, and a scratchpad that empties itself when you glance at another would be worse
-   * than one that does not.
+   * One set for every connection rather than one each: the common case is looking at one
+   * database, and scratchpads that empty themselves when you glance at another would be worse
+   * than ones that do not. A config from before tabs has a single `sql` instead, which
+   * `migrateTabs` turns into the first tab.
    */
-  sql: string;
+  tabs: QueryTab[];
+  activeTab: string;
+  /** Queries saved by name, each with the connection it was saved against. */
+  queries: SavedQuery[];
   /** Queries that have run, newest first, across all connections. Filtered on display. */
   history: HistoryEntry[];
 }
 
-const DEFAULTS: Saved = { connections: [], lastId: "", sql: "", history: [] };
+interface SavedQuery {
+  id: string;
+  /** The connection it belongs to: a query is written against one database's tables. */
+  connId: string;
+  name: string;
+  sql: string;
+}
+
+const DEFAULTS: Saved = { connections: [], lastId: "", ...migrateTabs({}), queries: [], history: [] };
+
+/** One tab's last run: what the results pane shows when the tab is opened again. */
+interface TabRun {
+  results: Result[];
+  error: string;
+  took: number | null;
+  /** The table the results came from, which is what an edit writes to. */
+  ranTable: string | null;
+  /** The statement behind each result, which Load more runs again for the next page. */
+  statements: string[];
+}
+const NO_RUN: TabRun = { results: [], error: "", took: null, ranTable: null, statements: [] };
+
+/**
+ * Each tab's last run, by connection and tab, for as long as the plugin is loaded.
+ *
+ * At module scope because the component unmounts whenever Deck shows another tab, and coming back
+ * to an empty grid would mean running every query again. Kept per connection so a tab opened
+ * against another database never shows rows from this one. Not saved: rows are the database's to
+ * keep, not the config's.
+ */
+const lastRuns = new Map<string, TabRun>();
 
 export default function Database() {
   const [cfg, setCfg] = useState<Saved>(DEFAULTS);
@@ -88,9 +127,15 @@ export default function Database() {
   cfgRef.current = cfg;
 
   // The live source, so leaving the tab frees it. Without this every visit opens another copy —
-  // another wasm heap for a file, or another pair of pools on someone else's server.
+  // another open file (a DuckDB one locks other programs out), or another pair of pools on
+  // someone else's server.
   const srcRef = useRef<Source | null>(null);
   useEffect(() => () => { void srcRef.current?.close(); srcRef.current = null; }, []);
+
+  // The config as last read or written, so a save that changes nothing writes nothing. Every
+  // config write wakes every config listener in Deck, and this one is saved on each tab switch,
+  // each run and each unmount, most of which change nothing on disk.
+  const written = useRef("");
 
   const save = useCallback(async (next: Saved) => {
     // The ref is updated HERE rather than only on the next render: adding a connection saves and
@@ -98,7 +143,14 @@ export default function Database() {
     // config from before the save and write the new connection back out of existence.
     cfgRef.current = next;
     setCfg(next);
-    await configWrite(CFG, JSON.stringify(next)).catch((e) => console.warn("[db] connections save failed", e));
+    const text = JSON.stringify(next);
+    if (text === written.current) return;
+    written.current = text;
+    await configWrite(CFG, text).catch((e) => {
+      // Forgotten, so the next save tries again rather than taking the failed one as on disk.
+      written.current = "";
+      console.warn("[db] connections save failed", e);
+    });
   }, []);
 
   const connect = useCallback(async (conn: Connection) => {
@@ -139,7 +191,13 @@ export default function Database() {
 
   useEffect(() => {
     void configRead(CFG).then((t) => {
-      const saved: Saved = t.trim() ? { ...DEFAULTS, ...JSON.parse(t) } : DEFAULTS;
+      // The old single buffer, `sql`, is taken out and handed to migrateTabs, which makes it the
+      // first tab when there are no tabs yet. It stays on disk until the next real change is
+      // written, so a config this version only read is never rewritten without it.
+      const { sql, ...raw } = t.trim() ? JSON.parse(t) : {};
+      const saved: Saved = { ...DEFAULTS, ...raw, ...migrateTabs({ ...raw, sql }) };
+      cfgRef.current = saved;
+      written.current = JSON.stringify(saved);
       setCfg(saved);
       // Reconnect to whatever was open last, so the tab comes back where it was left. A server
       // that is no longer reachable surfaces as an error on the connection list, not a hang.
@@ -182,7 +240,7 @@ export default function Database() {
 
   return (
     <Browser source={source} conn={active} schema={schema} fks={fks}
-      initialSql={cfg.sql} history={cfg.history}
+      initialTabs={cfg.tabs} initialTab={cfg.activeTab} queries={cfg.queries} history={cfg.history}
       onToggleWrites={(v) => {
         const next = { ...active, allowWrites: v };
         setActive(next);
@@ -234,11 +292,27 @@ function blank(engine: EngineId): Connection {
   };
 }
 
-const ENGINES: { id: EngineId; label: string; hint: string }[] = [
-  { id: "sqlite", label: "SQLite", hint: "A .db, .sqlite or .sqlite3 file" },
-  { id: "postgres", label: "Postgres", hint: "postgres://user:password@host:5432/database" },
-  { id: "mysql", label: "MySQL", hint: "mysql://user:password@host:3306/database" },
+/**
+ * The engines the form offers. `ext` is the file picker's filter for a file engine; `port` is the
+ * server's usual one, the default for an SSH tunnel's far end; `ask` is what the editor takes,
+ * said in the empty results pane.
+ */
+const ENGINES: { id: EngineId; label: string; hint: string; ext?: string; port?: number; ask: string }[] = [
+  { id: "sqlite", label: "SQLite", hint: "A .db, .sqlite or .sqlite3 file", ext: "db", ask: "write a query above" },
+  { id: "duckdb", label: "DuckDB", hint: "A .duckdb file", ext: "duckdb", ask: "write a query above" },
+  { id: "postgres", label: "Postgres", hint: "postgres://user:password@host:5432/database", port: 5432, ask: "write a query above" },
+  { id: "mysql", label: "MySQL", hint: "mysql://user:password@host:3306/database", port: 3306, ask: "write a query above" },
+  {
+    id: "mssql", label: "SQL Server", port: 1433, ask: "write a query above",
+    hint: "mssql://user:password@host:1433/database?trustServerCertificate=true",
+  },
+  { id: "redis", label: "Redis", hint: "redis://host:6379/0", port: 6379, ask: "type a command above, such as GET user:1 or HGETALL user:1" },
+  {
+    id: "mongo", label: "MongoDB", hint: "mongodb://user:password@host:27017/database", port: 27017,
+    ask: `type a command above as JSON, such as {"find": "users", "filter": {}}`,
+  },
 ];
+const engineLabel = (e: EngineId) => ENGINES.find((x) => x.id === e)?.label ?? e;
 
 /**
  * The connection list, and the form for adding one.
@@ -262,7 +336,7 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
   const engine = ENGINES.find((e) => e.id === draft?.engine) ?? ENGINES[0];
 
   const browse = async () => {
-    const p = await pickFile("db").catch((e) => { console.warn("[db] file picker failed", e); return ""; });
+    const p = await pickFile(engine.ext ?? "db").catch((e) => { console.warn("[db] file picker failed", e); return ""; });
     if (p && draft) setDraft({ ...draft, target: p, name: draft.name || fileName(p) });
   };
 
@@ -311,14 +385,14 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
                 // A tone rather than the accent, which marks only what is selected.
                 <span className="size-[7px] shrink-0 rounded-full"
                   title={ENGINES.find((e) => e.id === c.engine)?.label ?? c.engine}
-                  style={{ background: c.engine === "sqlite" ? "var(--text-muted)" : "rgb(var(--tone-sky-400))" }} />
+                  style={{ background: isFile(c.engine) ? "var(--text-muted)" : "rgb(var(--tone-sky-400))" }} />
               )}
               <button onClick={() => { setPending(c.id); onConnect(c); }} disabled={busy}
                 className="min-w-0 flex-1 text-left disabled:opacity-50">
                 <div className="flex items-center gap-1.5">
                   <span className="truncate text-[12.5px] font-medium text-text-primary">{c.name}</span>
                   <span className={chipCls + " text-text-secondary"} style={{ background: "var(--bg-elev)" }}>
-                    {c.engine === "postgres" ? "Postgres" : c.engine === "mysql" ? "MySQL" : "SQLite"}
+                    {engineLabel(c.engine)}
                   </span>
                   {c.sshHost && (
                     <span className={chipCls + " text-text-muted"} style={{ background: "var(--bg-elev)" }}
@@ -348,7 +422,7 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
         <div className="mt-3 rounded-lg border border-subtle p-4"
           style={{ background: "var(--bg-card-glass)" }}>
           {/* The engine, as one group of buttons with the chosen one selected. */}
-          <div className="mb-3 inline-flex items-center gap-0.5 rounded-lg border border-subtle bg-elev p-0.5">
+          <div className="mb-3 inline-flex flex-wrap items-center gap-0.5 rounded-lg border border-subtle bg-elev p-0.5">
             {ENGINES.map((e) => (
               <button key={e.id} onClick={() => setDraft({ ...draft, engine: e.id, target: "" })}
                 aria-pressed={draft.engine === e.id}
@@ -369,14 +443,14 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
           </Field>
 
           <div className="mt-3">
-            <Field label={draft.engine === "sqlite" ? "Database file" : "Connection url"}
+            <Field label={isFile(draft.engine) ? "Database file" : "Connection url"}
               hint={engine.hint}>
               <div className="flex gap-2">
                 <TextInput value={draft.target}
                   onChange={(ev) => setDraft({ ...draft, target: ev.target.value })}
                   onKeyDown={(ev) => { if (ev.key === "Enter") commit(); }}
                   placeholder={engine.hint} />
-                {draft.engine === "sqlite" && (
+                {isFile(draft.engine) && (
                   <button onClick={browse}
                     className="flex shrink-0 items-center gap-1.5 rounded-lg border border-subtle bg-elev px-3 text-[12.5px] text-text-secondary transition-colors hover:border-strong hover:text-text-primary">
                     <FolderOpen size={14} /> Browse
@@ -386,14 +460,14 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
             </Field>
           </div>
 
-          {draft.engine !== "sqlite" && (
+          {!isFile(draft.engine) && (
             <div className="mt-3 rounded-lg border border-subtle p-3">
               <label className="flex cursor-pointer items-center gap-2 text-[12.5px] text-text-secondary">
                 <input type="checkbox" checked={!!draft.sshHost}
                   onChange={(ev) => setDraft({
                     ...draft,
                     sshHost: ev.target.checked ? "vps" : "",
-                    sshRemote: ev.target.checked ? (draft.sshRemote || "localhost:5432") : "",
+                    sshRemote: ev.target.checked ? (draft.sshRemote || `localhost:${engine.port ?? 5432}`) : "",
                   })}
                   className="accent-[var(--accent)]" />
                 <Plug size={12} className="text-text-muted" />
@@ -409,10 +483,10 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
                       placeholder="vps" />
                   </Field>
                   <Field label="Reach from there"
-                    hint="host:port as seen FROM the SSH host: a container address, or localhost:5432.">
+                    hint={`host:port as seen FROM the SSH host: a container address, or localhost:${engine.port ?? 5432}.`}>
                     <TextInput value={draft.sshRemote ?? ""}
                       onChange={(ev) => setDraft({ ...draft, sshRemote: ev.target.value })}
-                      placeholder="localhost:5432" />
+                      placeholder={`localhost:${engine.port ?? 5432}`} />
                   </Field>
                   <p className="text-[11.5px] text-text-muted">
                     Write the url below as if you were on that host; Deck points it at the tunnel.
@@ -422,7 +496,16 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
             </div>
           )}
 
-          {draft.engine !== "sqlite" && (
+          {/* A file is opened in place: with writes allowed they land in it, while whatever else
+              has it open goes on assuming it is the only writer. Said here, before connecting. */}
+          {isFile(draft.engine) && (
+            <p className="mt-2 text-[11.5px] leading-relaxed text-text-muted">
+              Deck opens the file itself, not a copy. With writes allowed they are saved to it, so
+              be careful with a database another app has open, such as a wallet or a sync client:
+              close that app first, or keep this connection read-only.
+            </p>
+          )}
+          {!isFile(draft.engine) && (
             <p className="mt-2 text-[11.5px] leading-relaxed text-text-muted">
               The url is saved on this machine only — never synced, never in the vault — but it is
               stored as plain text, password included. Fine for a local or development database;
@@ -444,7 +527,7 @@ function Connections({ list, error, busy, onConnect, onSave, onDelete }: {
         <div className="flex items-start gap-2.5 rounded-lg border border-subtle bg-elev px-3 py-3 text-[12.5px] leading-relaxed text-text-muted">
           <DatabaseIcon size={16} className="mt-0.5 shrink-0" />
           <div className="flex flex-col items-start gap-2.5">
-            <span>Open a SQLite file, or connect to a Postgres or MySQL server, to browse its tables and run queries. A connection is read-only until you allow writes.</span>
+            <span>Open a SQLite or DuckDB file, or connect to Postgres, MySQL, SQL Server, Redis or MongoDB, to browse what it holds and run queries. A connection is read-only until you allow writes.</span>
             <button onClick={() => setDraft(blank("sqlite"))} className={primaryBtn} style={accentFill}>
               <Plus size={14} /> Add a connection
             </button>
@@ -477,7 +560,7 @@ function fileName(path: string): string {
 }
 
 function defaultName(c: Connection): string {
-  if (c.engine === "sqlite") return c.target ? fileName(c.target) : "database.db";
+  if (isFile(c.engine)) return c.target ? fileName(c.target) : c.engine === "duckdb" ? "database.duckdb" : "database.db";
   // The database name out of the url, which is the part a person recognises.
   const m = /\/([^/?#]+)(?:[?#]|$)/.exec(c.target.replace(/^\w+:\/\/[^/]*/, ""));
   return m?.[1] ?? c.engine;
@@ -495,11 +578,11 @@ function redact(target: string): string {
 
 /** Schema on the left, editor over results on the right. */
 function Browser({
-  source, conn, schema, fks, initialSql, history,
+  source, conn, schema, fks, initialTabs, initialTab, queries, history,
   onToggleWrites, onPersist, onReopen, onClose, busy,
 }: {
   source: Source; conn: Connection; schema: SchemaTable[]; fks: ForeignKeyRef[];
-  initialSql: string; history: HistoryEntry[];
+  initialTabs: QueryTab[]; initialTab: string; queries: SavedQuery[]; history: HistoryEntry[];
   onToggleWrites: (v: boolean) => void;
   onPersist: (patch: Partial<Saved>) => void;
   onReopen: () => void; onClose: () => void; busy: boolean;
@@ -511,13 +594,33 @@ function Browser({
     [schema],
   );
   const [selected, setSelected] = useState<string | null>(null);
-  const [results, setResults] = useState<Result[]>([]);
-  const [error, setError] = useState("");
   const [ran, setRan] = useState(0);
-  // Where the history menu opens, under its button; null while it is closed.
+  // Where the history and saved-queries menus open, under their buttons; null while closed.
   const [historyAt, setHistoryAt] = useState<{ x: number; y: number } | null>(null);
-  // The table the CURRENT result came from, which is what an edit writes to.
-  const [ranTable, setRanTable] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<{ x: number; y: number } | null>(null);
+  const [prompt, setPrompt] = useState<NamePromptState | null>(null);
+  const [confirm, setConfirm] = useState<ConfirmState | null>(null);
+
+  // The tabs, with refs beside them for the callbacks that outlive a render (the unmount save,
+  // a run that finishes after a switch). The active tab's SQL in `tabs` is only as fresh as the
+  // last switch: the live text is `sql.current`, and `tabsNow()` folds it back in.
+  const [tabs, setTabs] = useState(initialTabs);
+  const [activeTab, setActiveTab] = useState(initialTab);
+  const tabsRef = useRef(tabs);
+  const activeRef = useRef(activeTab);
+  const tabsNow = () => tabsRef.current.map((t) => (t.id === activeRef.current ? { ...t, sql: sql.current } : t));
+  const queriesRef = useRef(queries);
+  queriesRef.current = queries;
+
+  // The open tab's last run. Written through setRun, which keeps it in `lastRuns` so it outlives
+  // this component, and re-renders.
+  const [, rerender] = useState(0);
+  const runKey = (tab: string) => `${conn.id}\n${tab}`;
+  const setRun = (tab: string, patch: Partial<TabRun>) => {
+    lastRuns.set(runKey(tab), { ...(lastRuns.get(runKey(tab)) ?? NO_RUN), ...patch });
+    rerender((n) => n + 1);
+  };
+  const { results, error, took, ranTable } = lastRuns.get(runKey(activeTab)) ?? NO_RUN;
   /**
    * When the statement in flight started, or null when nothing is running.
    *
@@ -527,11 +630,12 @@ function Browser({
    * "still working, 3.4s" is the thing worth saying and a bare spinner does not say it.
    */
   const [running, setRunning] = useState<number | null>(null);
-  // How long the last run took, shown beside its row count.
-  const [took, setTook] = useState<number | null>(null);
-  const [view, setView] = useState<"query" | "diagram">("query");
+  // The query and its results, the whole schema as a diagram, or one table's structure.
+  const [view, setView] = useState<"query" | "diagram" | { structure: string }>("query");
   // The editor owns the text; this mirrors it so the run button and Ctrl+Enter see the same SQL.
-  const sql = useRef(initialSql);
+  const sql = useRef(initialTabs.find((t) => t.id === initialTab)?.sql ?? "");
+  // The editor itself, for Format and Explain, which act on its selection and cursor.
+  const edRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   // What the editor would run right now — the selection if there is one. Set by the Editor, read
   // here, so this component never has to reach into Monaco.
   const selectedSql = useRef("");
@@ -542,7 +646,63 @@ function Browser({
 
   // Save the editor text when leaving the tab. On unmount rather than per keystroke: a config
   // write per character would be absurd, and this is the only moment the text can be lost.
-  useEffect(() => () => onPersist({ sql: sql.current }), []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => () => onPersist({ tabs: tabsNow(), activeTab: activeRef.current }), []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /**
+   * Make `next` the tab list and `active` the open tab, and save both.
+   *
+   * The one path for switching, adding, closing, renaming and reordering. Opening a different tab
+   * loads its SQL into the editor through the same `revision` signal a table click uses.
+   */
+  const commitTabs = (next: QueryTab[], active: string, extra?: Partial<Saved>) => {
+    const switched = active !== activeRef.current;
+    tabsRef.current = next;
+    activeRef.current = active;
+    setTabs(next);
+    setActiveTab(active);
+    if (switched) {
+      sql.current = next.find((t) => t.id === active)?.sql ?? "";
+      selectedSql.current = "";
+      setHasSelection(false);
+      setRan((n) => n + 1);
+    }
+    onPersist({ tabs: next, activeTab: active, ...extra });
+  };
+  const addTab = (name?: string, text = "") => {
+    const t = { id: `q${Date.now().toString(36)}`, name: name ?? nextTabName(tabsRef.current), sql: text };
+    commitTabs([...tabsNow(), t], t.id);
+  };
+  const closeTab = (id: string) => {
+    const list = tabsNow();
+    const at = list.findIndex((t) => t.id === id);
+    let rest = list.filter((t) => t.id !== id);
+    // The last tab closing leaves a fresh empty one: the editor always has a tab to belong to.
+    if (!rest.length) rest = [{ id: `q${Date.now().toString(36)}`, name: nextTabName([]), sql: "" }];
+    lastRuns.delete(runKey(id));
+    commitTabs(rest, id === activeRef.current ? rest[Math.min(at, rest.length - 1)].id : activeRef.current);
+  };
+
+  /** Save the open tab's SQL under a name, for this connection. The same name replaces. */
+  const saveQuery = () => {
+    const tab = tabsRef.current.find((t) => t.id === activeRef.current);
+    setPrompt({
+      title: "Save query",
+      subtitle: `Kept with ${conn.name}, under Saved.`,
+      initial: tab?.name ?? "",
+      placeholder: "Query name",
+      onSave: (raw) => {
+        const name = raw.trim();
+        if (!name) return;
+        const q: SavedQuery = { id: `s${Date.now().toString(36)}`, connId: conn.id, name, sql: sql.current };
+        // The tab takes the name too, so it reads as the saved query it now is.
+        commitTabs(tabsNow().map((t) => (t.id === activeRef.current ? { ...t, name } : t)), activeRef.current, {
+          queries: [...queriesRef.current.filter((x) => !(x.connId === conn.id && x.name === name)), q],
+        });
+        toast("Saved");
+      },
+    });
+  };
+  const savedHere = queries.filter((q) => q.connId === conn.id);
   // The split between query and results. `min` leaves a couple of lines visible rather than
   // letting the editor collapse to nothing, which looks like a bug rather than a choice.
   const [editorHeight, dragProps] = useResize({
@@ -561,49 +721,56 @@ function Browser({
    */
   const runText = useCallback(async (explicit?: string) => {
     const text = explicit ?? textToRun(sql.current, selectedSql.current);
-    const statements = splitStatements(text);
+    const statements = statementsFor(engine, text);
     if (!statements.length) return;
-    const blocked = statements.filter((s) => !isReadOnly(s));
+    // The tab this run belongs to, captured now: its results land there even if another tab is
+    // open by the time a slow server answers.
+    const tab = activeRef.current;
+    // The SQL allowlist only judges SQL. A Redis or MongoDB command goes to Rust, whose list of
+    // read commands refuses a write on a read-only connection with the reason.
+    const blocked = isSql(engine) ? statements.filter((s) => !isReadOnly(s)) : [];
     if (blocked.length && !allowWrites) {
-      setError(
+      setRun(tab, { results: [], error:
         `Blocked ${blocked.length} statement${blocked.length > 1 ? "s" : ""} that would modify `
         + `the database. Turn on "Allow writes" for this connection to run them — `
-        // What a write actually COSTS differs per engine, and saying the wrong one is worse than
-        // saying nothing: a file's writes are thrown away, a server's are permanent.
-        + (engine === "sqlite"
-          ? "for a file they change the in-memory copy only and are discarded on close."
+        // What a write actually reaches, said plainly: the file itself, or the server. Either way
+        // it is permanent.
+        + (isFile(engine)
+          ? "they are saved to the file itself, so take care if another app has it open."
           : "on a server they are permanent.")
         + `\n\n${blocked.join(";\n")}`,
-      );
-      setResults([]);
+      });
       return;
     }
-    setError("");
     const started = Date.now();
     setRunning(started);
     // Which table these rows came from, decided by the SQL that is about to run. The sidebar
     // selection cannot answer it: a typed query sets no selection, and an old one would name a
     // table the user is not looking at — which would send an edit to the wrong place.
-    setRanTable(statements.length === 1 ? singleTable(statements[0]) : null);
+    setRun(tab, {
+      error: "",
+      ranTable: isSql(engine) && statements.length === 1 ? singleTable(statements[0]) : null,
+      statements,
+    });
     const out: Result[] = [];
     try {
       // Each statement in turn, so a failure reports which one and keeps what ran before it.
       // One at a time also matters for the servers: Postgres refuses several per round trip.
       for (const s of statements) out.push(await source.run(s, allowWrites));
-      setResults(out);
-      setTook(Date.now() - started);
+      setRun(tab, { results: out, took: Date.now() - started });
       // Recorded only once it RAN. A query that was blocked or threw is not one to offer back.
       onPersist({
-        sql: sql.current,
+        tabs: tabsNow(),
+        activeTab: activeRef.current,
         history: pushHistory(historyRef.current, text, conn.id, Date.now()),
       });
     } catch (e) {
-      setResults(out);
-      setError(String(e));
+      setRun(tab, { results: out, error: String(e) });
     }
     setRunning(null);
     setRan((n) => n + 1);
-  }, [source, allowWrites, conn.id, onPersist]);
+    // setRun and tabsNow read only refs and the connection, which are already listed.
+  }, [source, allowWrites, conn.id, onPersist]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /**
    * Apply one editing statement, then reload the grid.
@@ -614,7 +781,7 @@ function Browser({
    */
   const applyEdit = useCallback(async (statement: string) => {
     if (!allowWrites) {
-      setError("Turn on \"Allow writes\" for this connection to change data.");
+      setRun(activeRef.current, { error: "Turn on \"Allow writes\" for this connection to change data." });
       return;
     }
     setRunning(Date.now());
@@ -623,15 +790,57 @@ function Browser({
       toast("Applied");
       await runText(sql.current);
     } catch (e) {
-      setError(`${statement}
+      setRun(activeRef.current, { error: `${statement}
 
-${String(e)}`);
+${String(e)}` });
     }
     setRunning(null);
-  }, [source, allowWrites, runText]);
+  }, [source, allowWrites, runText]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const execute = useCallback(() => { void runText(); }, [runText]);
   const runAll = useCallback(() => { void runText(sql.current); }, [runText]);
+
+  /**
+   * The plan for what the user means: the selection, or else the statement the cursor is in.
+   *
+   * Run through runText like any query, so the plan shows as an ordinary result, lands in the
+   * history and goes past the same read-only guard (an EXPLAIN is a read, and plain EXPLAIN does
+   * not execute the statement it plans).
+   */
+  const explain = () => {
+    const ed = edRef.current;
+    const pos = ed?.getPosition();
+    const offset = pos ? (ed?.getModel()?.getOffsetAt(pos) ?? 0) : 0;
+    const text = selectedSql.current.trim() ? selectedSql.current : statementAt(sql.current, offset);
+    const plans = splitStatements(text).map((s) => explainFor(engine, s));
+    if (plans.length && plans.every((p) => p !== null)) void runText(plans.join(";\n"));
+  };
+
+  /**
+   * The next page of result `i`, appended to it.
+   *
+   * The statement is run again past the rows already shown, and ALWAYS read-only: a page is only
+   * ever more rows to look at, so loading one can never repeat a write the first run made.
+   */
+  const loadMore = async (i: number) => {
+    const tab = activeRef.current;
+    const was = lastRuns.get(runKey(tab)) ?? NO_RUN;
+    const r = was.results[i];
+    const statement = was.statements[i];
+    if (!r || !statement) return;
+    setRunning(Date.now());
+    try {
+      const next = await source.run(statement, false, r.rows.length);
+      const now = lastRuns.get(runKey(tab)) ?? NO_RUN;
+      // Run again meanwhile: this page belongs to rows no longer on screen.
+      if (now.results[i] === r) {
+        setRun(tab, { results: now.results.map((x, j) => (j === i ? appendPage(x, next) : x)) });
+      }
+    } catch (e) {
+      setRun(tab, { error: `Could not load more rows: ${String(e)}` });
+    }
+    setRunning(null);
+  };
 
   // History as a ref too: execute() is a callback and would otherwise capture the list as it was
   // when it was built, losing every entry but the first.
@@ -659,6 +868,10 @@ ${String(e)}`);
   };
 
   const forThisDb = history.filter((h) => h.path === conn.id);
+  const canExplain = explainFor(engine, "select 1") !== null;
+  // The table whose structure is open, if that is the view. Gone after a reload that dropped it.
+  const structureOf = typeof view === "object" ? schema.find((t) => t.name === view.structure) : undefined;
+  const showStructure = (name: string) => { setSelected(name); setView({ structure: name }); };
 
   // App.tsx wraps every module in `px-6 pb-3 pt-3`, which is right for a module that reads as a
   // card on the wallpaper and wrong for this one, where the schema pane and results grid should
@@ -670,27 +883,60 @@ ${String(e)}`);
     // the element would be pulled up without growing and leave a strip of wallpaper at the
     // bottom. flex-1 claims the whole track, which is what the negative margins are for.
     <div className="-mx-6 -mb-3 -mt-3 flex min-h-0 flex-1">
-      <Schema source={source} tables={schema} selected={selected} onPick={pick}
-        onQuery={(text, andRun) => setEditorText(text, andRun)} engine={engine}
+      {/* With a structure open, a table click shows that table's structure: the view stays the
+          one the user chose. The menu's queries go to the editor, where they can be seen. */}
+      <Schema source={source} tables={schema} selected={selected} conn={conn}
+        onPick={(name) => (typeof view === "object" ? showStructure(name) : pick(name))}
+        onQuery={(text, andRun) => { setView("query"); setEditorText(text, andRun); }} engine={engine}
+        onStructure={showStructure}
         width={sidebarWidth} dragProps={sidebarDrag} />
 
       {/* Opaque only on this side: a data grid over the wallpaper is unreadable in a way a list
           of table names is not, and it gives the sticky column headers (`bg-app/95`) something
           real to be opaque against. The schema pane keeps Deck's glass. */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-app">
-        {/* Which database this is, and what may be done to it. */}
-        <div className="flex shrink-0 items-center gap-2 px-3 pb-1 pt-2">
-          <DatabaseIcon size={14} className="shrink-0 text-text-muted" />
-          <span className="shrink-0 truncate text-[13px] font-semibold text-text-primary" title={conn.target}>
-            {conn.name}
-          </span>
-          <span className={chipCls + " text-text-secondary"} style={{ background: "var(--bg-elev)" }}>
-            {ENGINES.find((e) => e.id === engine)?.label ?? engine}
-          </span>
-          <span className="min-w-0 truncate text-[11px] text-text-muted" title={conn.target}>{redact(conn.target)}</span>
-
+        {/* One row: which database, the query tabs, then what may be done to it. A tab picked
+            from the diagram or a structure goes back to the query. */}
+        <TabStrip chip
+          tabs={tabs.map((t) => ({ id: t.id, title: t.name }))}
+          activeId={activeTab}
+          onSelect={(id) => { setView("query"); if (id !== activeRef.current) commitTabs(tabsNow(), id); }}
+          onClose={closeTab}
+          onDoubleClick={(id) => setPrompt({
+            title: "Rename tab",
+            initial: tabsRef.current.find((t) => t.id === id)?.name ?? "",
+            confirmLabel: "Rename",
+            onSave: (raw) => {
+              const name = raw.trim();
+              if (name) commitTabs(tabsNow().map((t) => (t.id === id ? { ...t, name } : t)), activeRef.current);
+            },
+          })}
+          onReorder={(from, to) => {
+            const list = tabsNow();
+            const moving = list.find((t) => t.id === from);
+            if (!moving) return;
+            const next = list.filter((t) => t.id !== from);
+            next.splice(list.findIndex((t) => t.id === to), 0, moving);
+            commitTabs(next, activeRef.current);
+          }}
+          onAdd={() => addTab()} addTitle="New query tab"
+          trailing={<>
+            <button onClick={saveQuery} title="Save this tab's SQL under a name, for this database"
+              className={smallBtn}>
+              <BookmarkPlus size={11} /> Save query
+            </button>
+            <button disabled={savedHere.length === 0} aria-haspopup="menu" aria-expanded={!!savedAt}
+              onClick={(e) => {
+                const r = e.currentTarget.getBoundingClientRect();
+                setSavedAt((at) => (at ? null : { x: r.right, y: r.bottom + 4 }));
+              }}
+              title={savedHere.length ? "Queries saved for this database" : "No saved queries for this database yet"}
+              className={smallBtn}
+              style={savedAt ? { background: "var(--accent-soft)", color: "var(--text-primary)" } : undefined}>
+              <Bookmark size={11} /> Saved{savedHere.length ? ` (${savedHere.length})` : ""}
+            </button>
           {/* The query and its results, or the whole schema drawn as a diagram. */}
-          <div className="ml-auto flex shrink-0 items-center gap-0.5 rounded-lg border border-subtle bg-elev p-0.5">
+          <div className="ml-1 flex shrink-0 items-center gap-0.5 rounded-lg border border-subtle bg-elev p-0.5">
             {([["query", "Query", Code2], ["diagram", "Diagram", Network]] as const).map(([id, label, Icon]) => (
               <button key={id} onClick={() => setView(id)} aria-pressed={view === id}
                 className={"flex h-6 items-center gap-1.5 rounded-md px-2 text-[12px] transition-colors " + (view === id ? "text-text-primary" : "text-text-muted hover:text-text-primary")}
@@ -701,26 +947,56 @@ ${String(e)}`);
           </div>
 
           <label className="ml-2 flex shrink-0 cursor-pointer items-center gap-2 text-[12px] text-text-secondary"
-            title={engine === "sqlite"
-              ? "Writes apply to the in-memory copy only and are never saved to the file."
+            title={isFile(engine)
+              ? "Writes are saved to the file itself. Off means the file is opened read-only. Take care with a file another app has open, such as a wallet or a sync client."
               : "Writes reach the real database. Off means the server itself refuses them."}>
             Allow writes
             <Toggle on={allowWrites} onChange={onToggleWrites} />
           </label>
 
-          <button onClick={onReopen} disabled={busy} title="Reload the file from disk" className={toolBtn}>
+          <button onClick={onReopen} disabled={busy}
+            title={isFile(engine) ? "Reload the file from disk" : "Reconnect and read the schema again"} className={toolBtn}>
             <RefreshCw size={12} className={busy ? "animate-spin" : ""} /> Reload
           </button>
           <button onClick={onClose} title="Close this database"
             className="grid size-7 shrink-0 place-items-center rounded-lg text-text-muted transition-colors hover:bg-white/5 hover:text-text-primary">
             <X size={14} />
           </button>
-        </div>
-
+          </>} />
+        {savedAt && savedHere.length > 0 && (
+          <ContextMenu x={savedAt.x} y={savedAt.y} alignRight onClose={() => setSavedAt(null)}
+            items={savedHere.map((q) => ({
+              label: q.name,
+              subLabel: q.sql.replace(/\s+/g, " ").slice(0, 120),
+              icon: Bookmark,
+              // A new tab rather than the open one: opening a saved query must not overwrite
+              // whatever is being written in the current tab.
+              onClick: () => addTab(q.name, q.sql),
+              action: {
+                icon: Trash2, title: "Delete", danger: true,
+                onClick: () => setConfirm({
+                  title: `Delete ${q.name}?`,
+                  body: "The saved query goes. Tabs already opened from it keep their SQL.",
+                  confirmLabel: "Delete",
+                  onConfirm: () => onPersist({ queries: queriesRef.current.filter((x) => x.id !== q.id) }),
+                }),
+              },
+            }))} />
+        )}
         {view === "diagram" && (
           <div className="m-2 mt-1.5 flex min-h-0 flex-1 flex-col overflow-hidden rounded-[10px] border border-subtle bg-card">
             <Diagram tables={schema} fks={fks} layoutKey={conn.id} onOpen={(name) => { setView("query"); pick(name); }} />
           </div>
+        )}
+        {structureOf && (
+          <Structure source={source} engine={engine} table={structureOf} fks={fks}
+            onOpen={showStructure}
+            onRows={() => { setView("query"); pick(structureOf.name); }} />
+        )}
+        {typeof view === "object" && !structureOf && (
+          <p className="m-auto p-8 text-center text-[12.5px] text-text-muted">
+            {view.structure} is no longer in this database.
+          </p>
         )}
         {view === "query" && <>
         {/* The query: one card, its run controls along the top and the editor under them. */}
@@ -745,6 +1021,24 @@ ${String(e)}`);
           </button>
           <kbd className="rounded-md px-1.5 py-0.5 font-sans text-[10.5px] text-text-muted" style={{ background: "var(--bg-elev)" }}>Ctrl+Enter</kbd>
           {running !== null && <Elapsed since={running} />}
+
+          {/* SQL only: a Redis command line or a MongoDB command has no plan to ask for and no SQL
+              to lay out. SQL Server is SQL with no EXPLAIN, so the button stays and says so. */}
+          {isSql(engine) && <>
+            <button onClick={explain} disabled={running !== null || !canExplain}
+              title={!canExplain
+                ? "SQL Server has no EXPLAIN statement; its plans need SET SHOWPLAN, which Deck does not run"
+                : isFile(engine)
+                  ? "Show the query plan for the selection, or the statement the cursor is in"
+                  : "Show the server's plan for the selection, or the statement the cursor is in, without running it"}
+              className={toolBtn}>
+              <ListTree size={12} /> Explain
+            </button>
+            <button onClick={() => { if (edRef.current) formatIn(edRef.current, engine); }}
+              title="Format the selection, or all of it (Shift+Alt+F)" className={toolBtn}>
+              <WandSparkles size={12} /> Format
+            </button>
+          </>}
 
           {/* aria-expanded tells the menu this button opened it, so pressing it again closes it. */}
           <button disabled={forThisDb.length === 0} aria-haspopup="menu" aria-expanded={!!historyAt}
@@ -779,7 +1073,7 @@ ${String(e)}`);
             selectedSql.current = v;
             setHasSelection(Boolean(v.trim()));
           }}
-          revision={ran} height={editorHeight} cols={cols} />
+          revision={ran} height={editorHeight} cols={cols} engine={engine} edRef={edRef} />
         </div>
 
         {/* The split between the query and its results: a slim bar with room to grab it, lit in
@@ -789,26 +1083,58 @@ ${String(e)}`);
 
         <div className="mx-2 mb-2 flex min-h-0 flex-1 flex-col overflow-hidden rounded-[10px] border border-subtle bg-card">
           <Results results={results} error={error} table={selected} fks={fks} onFollow={follow}
-            running={running} took={took}
+            running={running} took={took} tabKey={activeTab} onMore={(i) => void loadMore(i)}
             engine={engine} allowWrites={allowWrites} editTable={ranTable}
             tableColumns={ranTable ? (cols.get(ranTable) ?? []) : []}
             onEdit={(st) => void applyEdit(st)} />
         </div>
         </>}
       </div>
+      <NamePrompt state={prompt} onClose={() => setPrompt(null)} />
+      <ConfirmDialog state={confirm} onClose={() => setConfirm(null)} />
     </div>
   );
 }
 
+/**
+ * Format the editor's selection, or all of it when nothing is selected.
+ *
+ * As an edit rather than setValue, so Ctrl+Z puts the old layout back. SQL the formatter cannot
+ * parse is left exactly as it was, with the reason in a toast.
+ */
+function formatIn(ed: monaco.editor.IStandaloneCodeEditor, engine: EngineId) {
+  const model = ed.getModel();
+  if (!model) return;
+  const sel = ed.getSelection();
+  const range = sel && !sel.isEmpty() ? sel : model.getFullModelRange();
+  const text = model.getValueInRange(range);
+  if (!text.trim()) return;
+  let formatted: string;
+  try {
+    formatted = formatSql(engine, text);
+  } catch (e) {
+    toast(`Could not format: ${e instanceof Error ? e.message : String(e)}`);
+    return;
+  }
+  if (formatted === text) return;
+  ed.pushUndoStop();
+  ed.executeEdits("db-format", [{ range, text: formatted }]);
+  ed.pushUndoStop();
+}
+
 /** Tables and views; clicking one expands its columns and previews it. */
 function Schema({
-  source, tables: list, selected, onPick, onQuery, engine, width, dragProps,
+  source, tables: list, selected, onPick, onQuery, onStructure, engine, width, dragProps, conn,
 }: {
   source: Source; tables: SchemaTable[];
+  /** The open connection, named at the top of the sidebar. */
+  conn: Connection;
   selected: string | null;
   onPick: (name: string) => void;
   /** Put SQL in the editor. `run` false leaves it for the user to edit before running. */
   onQuery: (sql: string, run: boolean) => void;
+  /** Open a table's Structure view. */
+  onStructure: (name: string) => void;
   engine: EngineId;
   width: number; dragProps: { onMouseDown: (e: React.MouseEvent) => void };
 }) {
@@ -840,7 +1166,8 @@ function Schema({
     }
     onPick(t.name);
     setOpen(t.name);
-    if (t.kind === "table" && !counts.has(t.name)) {
+    // A Redis key group has no count to ask for: how many keys it holds is already its columns.
+    if (t.kind === "table" && countFor(engine, t.name) && !counts.has(t.name)) {
       // -1 means "counting": the row shows a dash rather than nothing, so a slow count reads as
       // in progress rather than as a table whose count is unavailable.
       setCounts((m) => new Map(m).set(t.name, -1));
@@ -852,15 +1179,25 @@ function Schema({
 
   const tableCount = list.filter((t) => t.kind === "table").length;
   const viewCount = list.length - tableCount;
+  // What a "table" is called here: Redis groups keys by pattern, MongoDB holds collections.
+  const noun = engine === "redis" ? "key group" : engine === "mongo" ? "collection" : "table";
 
   return (
     <>
       <div className="flex shrink-0 flex-col overflow-hidden border-r border-subtle bg-panel/80 backdrop-blur-xl blur-surface"
         style={{ width }}>
         <div className="shrink-0 px-2 pb-1.5 pt-2">
+          {/* Which database this is; its address is in the tooltip. */}
+          <div className="mb-1 flex min-w-0 items-center gap-2 px-1" title={redact(conn.target)}>
+            <DatabaseIcon size={14} className="shrink-0 text-text-muted" />
+            <span className="min-w-0 truncate text-[13px] font-semibold text-text-primary">{conn.name}</span>
+            <span className={chipCls + " ml-auto text-text-secondary"} style={{ background: "var(--bg-elev)" }}>
+              {ENGINES.find((e) => e.id === engine)?.label ?? engine}
+            </span>
+          </div>
           <div className="mb-1.5 flex items-baseline gap-1.5 px-1 text-[11.5px] text-text-muted">
             <span>
-              {tableCount} table{tableCount === 1 ? "" : "s"}
+              {tableCount} {noun}{tableCount === 1 ? "" : "s"}
             </span>
             {viewCount > 0 && <span>{"·"} {viewCount} view{viewCount === 1 ? "" : "s"}</span>}
           </div>
@@ -868,7 +1205,7 @@ function Schema({
           <div className="flex h-7 items-center gap-1.5 rounded-lg border border-subtle bg-elev pl-2 pr-1 transition-colors focus-within:border-[var(--accent)]">
             <Search size={12} className="shrink-0 text-text-muted" />
             <input value={filter} onChange={(e) => setFilter(e.target.value)}
-              placeholder="Filter tables and columns"
+              placeholder={isSql(engine) ? "Filter tables and columns" : `Filter ${noun}s and fields`}
               className="min-w-0 flex-1 bg-transparent text-[12px] text-text-primary outline-none placeholder:text-text-muted" />
             {filter && (
               <button onClick={() => setFilter("")} title="Clear the filter" className={iconBtn}><X size={12} /></button>
@@ -878,7 +1215,7 @@ function Schema({
 
         <div className="scroll-thin min-h-0 flex-1 overflow-auto px-1.5 pb-2">
           {shown.length === 0 && (list.length === 0
-            ? <p className="px-1.5 py-3 text-[12px] text-text-muted">This database has no tables or views yet.</p>
+            ? <p className="px-1.5 py-3 text-[12px] text-text-muted">{isSql(engine) ? "This database has no tables or views yet." : `This database has no ${noun}s yet.`}</p>
             : (
               <div className="flex flex-col items-start gap-2 px-1.5 py-3 text-[12px] text-text-muted">
                 <span>No table or column matches “{filter.trim()}”.</span>
@@ -940,6 +1277,10 @@ function Schema({
                         </span>
                       </div>
                     ))}
+                    <button onClick={() => onStructure(t.name)}
+                      className="mt-1 flex items-center gap-1 text-[10px] text-text-muted transition-colors hover:text-text-secondary">
+                      <TableProperties size={9} />Structure
+                    </button>
                     {t.sql && (
                       <details className="mt-1">
                         <summary className="cursor-pointer list-none text-[10px] text-text-muted hover:text-text-secondary">
@@ -964,7 +1305,7 @@ function Schema({
 
       {menu && (
         <ContextMenu x={menu.x} y={menu.y} onClose={() => setMenu(null)}
-          items={tableMenu(engine, menu.table, onQuery, () => setFilter(menu.table.name))} />
+          items={tableMenu(engine, menu.table, onQuery, () => setFilter(menu.table.name), onStructure)} />
       )}
     </>
   );
@@ -983,6 +1324,7 @@ function tableMenu(
   t: SchemaTable,
   onQuery: (sql: string, run: boolean) => void,
   filterByName: () => void,
+  onStructure: (name: string) => void,
 ): MenuEntry[] {
   const q = (name: string) => quoteFor(engine, name);
   const cols = t.columns.map((c) => q(c.name)).join(", ");
@@ -990,23 +1332,45 @@ function tableMenu(
 
   const items: MenuEntry[] = [
     {
+      // Opens a view rather than writing SQL: its columns, keys, indexes and DDL, read-only.
+      label: "Show structure",
+      icon: TableProperties,
+      onClick: () => onStructure(t.name),
+    },
+    {
       label: "Select all rows",
       icon: Table2,
       onClick: () => onQuery(previewFor(engine, t.name), true),
     },
-    {
+  ];
+  const count = countFor(engine, t.name);
+  if (count) {
+    items.push({
       label: "Count rows",
       icon: Hash,
-      onClick: () => onQuery(`select count(*) from ${q(t.name)};`, true),
-    },
-    {
-      // Named columns rather than *, which is what anyone writes a real query from.
-      label: "Select columns…",
-      subLabel: `${t.columns.length} column${t.columns.length === 1 ? "" : "s"}`,
-      icon: Columns3,
-      onClick: () => onQuery(`select ${cols}\nfrom ${q(t.name)}\nlimit 200;`, false),
-    },
-  ];
+      onClick: () => onQuery(isSql(engine) ? `${count};` : count, true),
+    });
+  }
+  // The rest writes SQL, which a Redis key group or a MongoDB collection has no use for.
+  if (!isSql(engine)) {
+    items.push("sep");
+    items.push({ label: "Filter the list by this name", icon: Search, onClick: filterByName });
+    items.push({
+      label: "Copy name",
+      icon: Copy,
+      onClick: () => void navigator.clipboard.writeText(t.name).catch(() => {}),
+    });
+    return items;
+  }
+  items.push({
+    // Named columns rather than *, which is what anyone writes a real query from.
+    label: "Select columns…",
+    subLabel: `${t.columns.length} column${t.columns.length === 1 ? "" : "s"}`,
+    icon: Columns3,
+    onClick: () => onQuery(engine === "mssql"
+      ? `select top 200 ${cols}\nfrom ${q(t.name)};`
+      : `select ${cols}\nfrom ${q(t.name)}\nlimit 200;`, false),
+  });
 
   if (pk) {
     items.push({
@@ -1096,13 +1460,19 @@ function shortType(type: string): string {
  * every keystroke; `revision` is the signal to pull the text back in when something else (a
  * table click) changed it.
  */
-function Editor({ value, onChange, onRun, onSelect, revision, height, cols }: {
+function Editor({ value, onChange, onRun, onSelect, revision, height, cols, engine, edRef }: {
   value: () => string; onChange: (v: string) => void; onRun: () => void;
   onSelect: (v: string) => void; revision: number; height: number;
   cols: Map<string, Column[]>;
+  /** Which dialect Format lays the SQL out in. */
+  engine: EngineId;
+  /** Given the live editor, for the toolbar's Format and Explain. */
+  edRef: React.MutableRefObject<monaco.editor.IStandaloneCodeEditor | null>;
 }) {
   const host = useRef<HTMLDivElement>(null);
-  const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
+  const editor = edRef;
+  const engineRef = useRef(engine);
+  engineRef.current = engine;
   // The latest onRun, so the Ctrl+Enter command does not capture a stale closure.
   const runRef = useRef(onRun);
   runRef.current = onRun;
@@ -1115,7 +1485,9 @@ function Editor({ value, onChange, onRun, onSelect, revision, height, cols }: {
     if (!host.current) return;
     const ed = monaco.editor.create(host.current, {
       value: value(),
-      language: "sql",
+      // JSON for a MongoDB command, plain text for a Redis command line: SQL colouring on either
+      // would mark ordinary words as keywords.
+      language: editorLanguage(engine),
       theme: "deck-dark",
       minimap: { enabled: false },
       lineNumbers: "on",
@@ -1132,6 +1504,18 @@ function Editor({ value, onChange, onRun, onSelect, revision, height, cols }: {
       onSelect(sel && !sel.isEmpty() ? (ed.getModel()?.getValueInRange(sel) ?? "") : "");
     });
     ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runRef.current());
+    // An action of this editor rather than a formatting provider: a provider is registered on
+    // Deck's shared Monaco for every SQL model, where it would compete with whatever formats the
+    // Editor module's .sql files. Its keybinding is Monaco's own Format Document chord, and it
+    // takes precedence in this editor only.
+    // SQL only, like the toolbar's Format: a Redis or MongoDB command has no SQL to lay out.
+    if (isSql(engineRef.current)) ed.addAction({
+      id: "deck-db.format",
+      label: "Format SQL",
+      keybindings: [monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF],
+      contextMenuGroupId: "1_modification",
+      run: () => formatIn(ed, engineRef.current),
+    });
 
     // Schema-aware completion. Registered GLOBALLY on Deck's shared Monaco — there is no
     // per-editor registration — so two things are mandatory: dispose it on unmount, or every
@@ -1184,10 +1568,23 @@ function Editor({ value, onChange, onRun, onSelect, revision, height, cols }: {
   return <div ref={host} style={{ height }} className="shrink-0 bg-card" />;
 }
 
-/** One grid per statement, plus whatever went wrong. */
+/** Copy text, and say so. A failure is said too: a silent no-op reads as copied. */
+function copyText(text: string, done: string) {
+  void navigator.clipboard.writeText(text)
+    .then(() => toast(done))
+    .catch((e) => { console.warn("[db] copy failed", e); toast(`Could not copy: ${String(e)}`); });
+}
+
+/** The text a copied cell gives: what the grid shows, except that NULL is nothing at all. */
+const cellText = (v: unknown) => (v === null || v === undefined ? "" : cell(v).text);
+
+/** The cell the value panel shows: which grid it is in, and what it holds. */
+interface Viewed { grid: number; column: string; type: string; value: unknown }
+
+/** One grid per statement, plus whatever went wrong, and the value panel beside them. */
 function Results({
   results, error, table, fks, onFollow, engine, allowWrites, editTable, tableColumns, onEdit,
-  running, took,
+  running, took, tabKey, onMore,
 }: {
   results: Result[]; error: string; table: string | null; running: number | null;
   /** How long the last run took, in ms. */
@@ -1195,61 +1592,145 @@ function Results({
   fks: ForeignKeyRef[]; onFollow: (fk: ForeignKeyRef, value: unknown) => void;
   engine: EngineId; allowWrites: boolean; editTable: string | null; tableColumns: Column[];
   onEdit: (statement: string) => void;
+  /** The query tab these results belong to: another tab's results are other grids. */
+  tabKey: string;
+  /** Load the next page of result `i`. */
+  onMore: (i: number) => void;
 }) {
-  const download = async (r: Result) => {
+  const download = async (r: Result, kind: "csv" | "json") => {
     // The rows EXPORTED are the rows on screen, which is what the cap makes them. Writing the
     // full result instead would silently disagree with the count shown above the grid.
-    const path = await pickSavePath("query.csv", "csv").catch((e) => { console.warn("[db] save dialog failed", e); return ""; });
+    const path = await pickSavePath(`query.${kind}`, kind).catch((e) => { console.warn("[db] save dialog failed", e); return ""; });
     if (!path) return;
     try {
-      await fsWrite(path, toCsv(r));
-      toast(`Exported ${r.rows.length.toLocaleString()} rows`);
+      await fsWrite(path, kind === "csv" ? toCsv(r) : toJson(r));
+      toast(`Exported ${r.rows.length.toLocaleString()} rows${r.truncated ? " (the rows on screen)" : ""}`);
     } catch (e) {
       toast(`Could not write the file: ${String(e)}`);
     }
   };
 
+  // The value panel: open or not, and the cell it shows. One for every grid, since it sits beside
+  // them all; a grid reports its picked cell here, and again when its rows change under it.
+  const [panel, setPanel] = useState(false);
+  const [viewed, setViewed] = useState<Viewed | null>(null);
+  useEffect(() => setViewed(null), [tabKey]);
+  const [panelWidth, panelDrag] = useResize({
+    initial: 320, min: 200, max: 720, direction: "horizontal", invert: true,
+  });
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-auto">
-      {error && (
-        <pre className="m-3 whitespace-pre-wrap rounded-lg border border-red-400/40 bg-red-400/5 p-3 text-[12px] text-red-300">
-          {error}
-        </pre>
-      )}
-      {results.map((r, i) => <Grid key={i} result={r} index={i} many={results.length > 1}
-        took={i === results.length - 1 ? took : null}
-        fks={table ? fks.filter((f) => f.table === table) : []} onFollow={onFollow}
-        engine={engine} table={editTable} allowWrites={allowWrites} tableColumns={tableColumns}
-        onEdit={onEdit}
-        onExport={() => void download(r)} />)}
-      {/* Over a tunnel the first query has nothing to show yet, so the empty state would read as
-          "no results" when it means "not finished". */}
-      {running !== null && !results.length && (
-        <div className="flex items-center justify-center gap-2 p-8 text-[12.5px] text-text-muted">
-          <RefreshCw size={14} className="animate-spin" /> Running…
-        </div>
-      )}
-      {!error && !results.length && running === null && (
-        <div className="m-auto flex flex-col items-center gap-2 p-8 text-center">
-          <span className="grid size-10 place-items-center rounded-full" style={{ background: "var(--bg-elev)" }}>
-            <Table2 size={18} className="text-text-muted" />
-          </span>
-          <span className="text-[13px] font-medium text-text-secondary">No results yet</span>
-          <span className="max-w-xs text-[12px] leading-relaxed text-text-muted">Pick a table on the left, or write a query above and press Ctrl+Enter.</span>
-        </div>
-      )}
+    <div className="flex min-h-0 flex-1">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-auto">
+        {error && (
+          <pre className="m-3 whitespace-pre-wrap rounded-lg border border-red-400/40 bg-red-400/5 p-3 text-[12px] text-red-300">
+            {error}
+          </pre>
+        )}
+        {/* Keyed by tab as well, so a grid's sort and picked cell stay with the tab they were
+            made in, while a re-run in the same tab (after an edit) keeps them. */}
+        {results.map((r, i) => <Grid key={`${tabKey}:${i}`} result={r} index={i} many={results.length > 1}
+          took={i === results.length - 1 ? took : null}
+          fks={table ? fks.filter((f) => f.table === table) : []} onFollow={onFollow}
+          engine={engine} table={editTable} allowWrites={allowWrites} tableColumns={tableColumns}
+          onEdit={onEdit}
+          onSave={(kind) => void download(r, kind)}
+          onMore={() => onMore(i)} busy={running !== null}
+          viewing={viewed?.grid === i}
+          onView={(v) => setViewed(v && { grid: i, ...v })}
+          panel={panel} onPanel={setPanel} />)}
+        {/* Over a tunnel the first query has nothing to show yet, so the empty state would read as
+            "no results" when it means "not finished". */}
+        {running !== null && !results.length && (
+          <div className="flex items-center justify-center gap-2 p-8 text-[12.5px] text-text-muted">
+            <RefreshCw size={14} className="animate-spin" /> Running…
+          </div>
+        )}
+        {!error && !results.length && running === null && (
+          <div className="m-auto flex flex-col items-center gap-2 p-8 text-center">
+            <span className="grid size-10 place-items-center rounded-full" style={{ background: "var(--bg-elev)" }}>
+              <Table2 size={18} className="text-text-muted" />
+            </span>
+            <span className="text-[13px] font-medium text-text-secondary">No results yet</span>
+            <span className="max-w-xs text-[12px] leading-relaxed text-text-muted">
+              Pick {engine === "redis" ? "a key group" : engine === "mongo" ? "a collection" : "a table"} on the left,
+              or {ENGINES.find((e) => e.id === engine)?.ask ?? "write a query above"} and press Ctrl+Enter.
+            </span>
+          </div>
+        )}
+      </div>
+      {panel && <>
+        <div {...panelDrag} title="Drag to resize"
+          className="w-1 shrink-0 cursor-col-resize border-l border-subtle transition-colors hover:border-[var(--accent)]" />
+        <ValuePanel viewed={viewed} width={panelWidth} onClose={() => setPanel(false)} />
+      </>}
+    </div>
+  );
+}
+
+/**
+ * One cell's whole value: long text wrapped, JSON laid out, a NULL said as NULL.
+ *
+ * The grid truncates every cell to keep rows one line high, which is right for scanning and
+ * wrong for reading a description or a JSON column; this is where those are read.
+ */
+function ValuePanel({ viewed, width, onClose }: {
+  viewed: Viewed | null; width: number; onClose: () => void;
+}) {
+  const v = viewed?.value;
+  const json = prettyJson(v);
+  const isNull = v === null || v === undefined;
+  const shown = json ?? cellText(v);
+  return (
+    <div className="flex min-h-0 shrink-0 flex-col" style={{ width }}>
+      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-subtle px-3">
+        <span className="min-w-0 truncate text-[12px] font-medium text-text-secondary" title={viewed?.column}>
+          {viewed ? viewed.column : "Value"}
+        </span>
+        {viewed?.type && <span className="shrink-0 font-mono text-[10.5px] text-text-muted">{shortType(viewed.type)}</span>}
+        {json && <span className={chipCls} style={chip("rgb(var(--tone-sky-400))")}>JSON</span>}
+        <span className="ml-auto" />
+        {viewed && !isNull && (
+          <button onClick={() => copyText(shown, "Copied")} title="Copy the value" className={smallBtn}>
+            <Copy size={11} /> Copy
+          </button>
+        )}
+        <button onClick={onClose} title="Close the value panel" className={iconBtn}><X size={13} /></button>
+      </div>
+      <div className="scroll-thin min-h-0 flex-1 overflow-auto p-3">
+        {!viewed ? (
+          <p className="text-[12px] leading-relaxed text-text-muted">
+            Click a cell to read its whole value here. Space or Enter opens this panel from the grid.
+          </p>
+        ) : isNull ? (
+          <span className="rounded px-1 text-[10px] tracking-wide text-text-muted" style={{ background: "var(--bg-elev)" }}>NULL</span>
+        ) : json ? (
+          <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-snug text-text-primary">{json}</pre>
+        ) : (
+          <div className="whitespace-pre-wrap break-words text-[12.5px] leading-relaxed text-text-primary">{shown}</div>
+        )}
+      </div>
     </div>
   );
 }
 
 function Grid({
-  result, index, many, took, fks, onFollow, engine, table, allowWrites, tableColumns, onEdit, onExport,
+  result, index, many, took, fks, onFollow, engine, table, allowWrites, tableColumns, onEdit, onSave,
+  viewing, onView, panel, onPanel, onMore, busy,
 }: {
   result: Result; index: number; many: boolean; took: number | null;
   fks: ForeignKeyRef[]; onFollow: (fk: ForeignKeyRef, value: unknown) => void;
   engine: EngineId; table: string | null; allowWrites: boolean; tableColumns: Column[];
   onEdit: (statement: string) => void;
-  onExport: () => void;
+  /** Save the rows on screen to a file. */
+  onSave: (kind: "csv" | "json") => void;
+  /** Whether the value panel is showing this grid's picked cell. */
+  viewing: boolean;
+  onView: (v: Omit<Viewed, "grid"> | null) => void;
+  /** Whether the value panel is open, and a way to open or close it. */
+  panel: boolean; onPanel: (open: boolean) => void;
+  /** Load the next page of these rows; `busy` while something is running. */
+  onMore: () => void; busy: boolean;
 }) {
   // Which cell is being edited, and the row being added, if any.
   const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
@@ -1266,9 +1747,9 @@ function Grid({
 
   // Why this result cannot be written to, if it cannot. Only the FIRST result of a script is
   // editable: the others are not what the grid is showing a table for.
-  const blocked = index > 0
+  const blocked = engineEditBlock(engine) ?? (index > 0
     ? "Only the first result is editable."
-    : editable(table, result.columns, tableColumns);
+    : editable(table, result.columns, tableColumns));
   const canEdit = allowWrites && !blocked;
   const pk = tableColumns.filter((c) => c.pk).map((c) => c.name);
 
@@ -1285,6 +1766,74 @@ function Grid({
     s?.index !== ci ? { index: ci, dir: "asc" }
       : s.dir === "asc" ? { index: ci, dir: "desc" }
         : null);
+  // Where the Export menu opens, under its button; null while it is closed.
+  const [exportAt, setExportAt] = useState<{ x: number; y: number } | null>(null);
+
+  /** The picked cell, as the value panel shows it, or null when no such cell is on screen. */
+  const viewOf = (p: { row: number; col: number } | null) => {
+    const row = p ? rows[p.row] : undefined;
+    if (!p || !row || p.col >= result.columns.length) return null;
+    const column = result.columns[p.col];
+    return { column, type: typeOf(column), value: row[p.col] };
+  };
+  const pick = (p: { row: number; col: number }) => {
+    setPicked(p);
+    onView(viewOf(p));
+  };
+  // A re-run after an edit, or a sort, changes what sits at the picked place; the panel follows
+  // what the ring is on rather than keeping the value from before.
+  const viewRef = useRef(() => {});
+  viewRef.current = () => { if (viewing && picked) onView(viewOf(picked)); };
+  useEffect(() => viewRef.current(), [result, sort]);
+
+  /**
+   * The grid's own keys: Ctrl+C copies the picked cell, Space or Enter opens the value panel.
+   *
+   * On the grid's element rather than through Deck's key bindings, so they hold only while focus
+   * is in the grid (a click on a cell puts it there): Monaco, the filter box and the cell editor
+   * keep Ctrl+C, and so does a text selection dragged across the grid.
+   */
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    const target = e.target as HTMLElement;
+    if (!picked || editing || target.closest("input, textarea")) return;
+    const plain = !e.shiftKey && !e.altKey;
+    // By code as well as key, so a non-Latin layout's Ctrl+C still counts, as App.tsx does for Ctrl+P.
+    if ((e.ctrlKey || e.metaKey) && plain && (e.code === "KeyC" || e.key.toLowerCase() === "c")) {
+      if (String(window.getSelection() ?? "")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      copyText(cellText(rows[picked.row]?.[picked.col]), "Copied");
+    } else if ((e.key === " " || e.key === "Enter") && plain && !e.ctrlKey && !e.metaKey
+      // A focused foreign-key link keeps Enter and Space for following it.
+      && !target.closest("button")) {
+      e.preventDefault();
+      onView(viewOf(picked));
+      onPanel(true);
+    }
+  };
+
+  const shownRows = `${result.rows.length.toLocaleString()} row${result.rows.length === 1 ? "" : "s"}`;
+  const copied = `Copied ${shownRows}${result.truncated ? " (the rows on screen)" : ""}`;
+  const exportItems: MenuEntry[] = [
+    // Said once at the top rather than on every item: everything below takes the same rows.
+    ...(result.truncated ? [{
+      label: `The ${result.rows.length.toLocaleString()} rows on screen; Load more for the rest`,
+      disabled: true,
+    }, "sep" as const] : []),
+    { label: "Copy as CSV", icon: Copy, onClick: () => copyText(toCsv(result), copied) },
+    { label: "Copy as JSON", icon: Copy, onClick: () => copyText(toJson(result), copied) },
+    {
+      label: "Copy as INSERT statements",
+      icon: Copy,
+      // Only with a table to insert into: a join or an expression has no one table to name.
+      subLabel: !isSql(engine) ? "SQL only" : table ? `into ${table}` : "Needs a select from one table",
+      disabled: !table || !isSql(engine),
+      onClick: () => { if (table) copyText(toInserts(engine, table, result), copied); },
+    },
+    "sep",
+    { label: "Save as CSV…", icon: Download, onClick: () => onSave("csv") },
+    { label: "Save as JSON…", icon: Download, onClick: () => onSave("json") },
+  ];
   // Only the columns this result actually has: a join's output may not carry the key column.
   const fkFor = (col: string) => fks.find((f) => f.column === col);
   if (!result.columns.length) {
@@ -1300,16 +1849,19 @@ function Grid({
       <div className="flex h-9 shrink-0 items-center gap-2 px-3 text-[11.5px] text-text-muted">
         {many && <span className={chipCls + " text-text-secondary"} style={{ background: "var(--bg-elev)" }}>#{index + 1}</span>}
         <span className="tabular-nums text-text-secondary">
-          {result.truncated
-            ? `${result.rows.length.toLocaleString()} of ${result.total.toLocaleString()} rows`
-            : `${result.total.toLocaleString()} row${result.total === 1 ? "" : "s"}`}
+          {/* "N+" while more exist: Deck reads a page at a time, so the full count is not known. */}
+          {`${result.rows.length.toLocaleString()}${result.truncated ? "+" : ""} row${result.rows.length === 1 && !result.truncated ? "" : "s"}`}
         </span>
-        {result.truncated && (
-          <span className={chipCls} title={`Only the first ${ROW_CAP.toLocaleString()} rows are shown`}
+        {result.truncated && <>
+          <span className={chipCls} title={`Rows are read ${ROW_CAP.toLocaleString()} at a time, and there are more`}
             style={{ color: "rgb(var(--tone-amber-400))", background: "color-mix(in srgb, rgb(var(--tone-amber-400)) 14%, transparent)" }}>
-            Capped at {ROW_CAP.toLocaleString()}
+            Capped at {result.rows.length.toLocaleString()}
           </span>
-        )}
+          <button onClick={onMore} disabled={busy}
+            title={`Read the next ${ROW_CAP.toLocaleString()} rows and add them below`} className={smallBtn}>
+            <ChevronDown size={11} /> Load more
+          </button>
+        </>}
         {took !== null && <span className="tabular-nums">{took < 1000 ? `${took} ms` : `${(took / 1000).toFixed(1)} s`}</span>}
         <span className="ml-auto" />
         {canEdit && (
@@ -1323,16 +1875,31 @@ function Grid({
           // something the user can act on — select the key, or query one table.
           <span className="text-[11px] text-text-muted" title={blocked}>Read-only result</span>
         )}
-        <button onClick={onExport} title="Copy as CSV"
-          className={smallBtn}>
-          <Download size={11} /> CSV
+        <button onClick={() => onPanel(!panel)} aria-pressed={panel}
+          title={panel ? "Hide the value panel" : "Show the picked cell's whole value (Space)"}
+          className={smallBtn}
+          style={panel ? { background: "var(--accent-soft)", color: "var(--text-primary)" } : undefined}>
+          <PanelRight size={11} /> Value
         </button>
+        <button aria-haspopup="menu" aria-expanded={!!exportAt}
+          onClick={(e) => {
+            const r = e.currentTarget.getBoundingClientRect();
+            setExportAt((at) => (at ? null : { x: r.right, y: r.bottom + 4 }));
+          }}
+          title="Copy or save the rows on screen"
+          className={smallBtn}
+          style={exportAt ? { background: "var(--accent-soft)", color: "var(--text-primary)" } : undefined}>
+          <Download size={11} /> Export <ChevronDown size={10} />
+        </button>
+        {exportAt && (
+          <ContextMenu x={exportAt.x} y={exportAt.y} alignRight onClose={() => setExportAt(null)} items={exportItems} />
+        )}
       </div>
       <ConfirmDialog state={confirm} onClose={() => setConfirm(null)} />
       {/* Scrolls both axes: a wide table must not push the whole pane sideways, and the sticky
           column headers need their vertical scroll container to be an ancestor — otherwise they
           have nothing to stick to and scroll away with the rows. */}
-      <div className="min-h-0 overflow-auto">
+      <div className="min-h-0 overflow-auto outline-none" tabIndex={0} onKeyDown={onKeyDown}>
         {/* Columns as wide as what is in them, not stretched to the pane: across a wide window a
             stretched number column puts the value a screen away from its heading. */}
         <table className="w-max min-w-[50%] border-collapse text-[12px]">
@@ -1402,7 +1969,7 @@ function Grid({
                   const isPicked = picked?.row === ri && picked.col === ci;
                   return (
                     <td key={ci}
-                      onClick={() => setPicked({ row: ri, col: ci })}
+                      onClick={() => pick({ row: ri, col: ci })}
                       onDoubleClick={canEdit ? () => {
                         setEditing({ row: ri, col: ci });
                         // NULL edits as empty, so clearing a cell and setting it to NULL are the

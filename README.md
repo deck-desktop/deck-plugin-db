@@ -1,9 +1,16 @@
 # Databases
 
-Browse SQLite files, Postgres and MySQL, and run queries against them.
+Browse SQLite and DuckDB files, Postgres, MySQL, SQL Server, Redis and MongoDB, and run queries
+against them. Every engine is opened by Deck itself (its db_* commands), a file in place: with
+writes allowed, a write is saved to the file.
 
-Tables, columns, row counts and a query editor with history. Results can be sorted, exported to
-CSV, and - where the query maps to a single table with a key - edited in place.
+Tables, columns, row counts and a query editor with tabs, saved queries, history, Format
+(Shift+Alt+F, by sql-formatter in the engine's dialect) and Explain. Results load 1,000 rows at
+a time (Load more for the next page), can be sorted, copied or saved as CSV, JSON or INSERT
+statements, read a cell at a time in the value panel (Ctrl+C copies the picked cell, Space or
+Enter opens the panel), and - where the query maps to a single table with a key - edited in place.
+A table's Structure view shows its columns, defaults, foreign keys in and out, indexes and CREATE
+statement.
 
 ## The read-only guard
 
