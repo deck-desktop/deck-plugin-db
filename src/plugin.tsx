@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import { configRead, configWrite, fsWrite, pickFile, pickSavePath } from "../shim/bridge.js";
 import {
-  ConfirmDialog, ContextMenu, Field, NamePrompt, TabStrip, TextInput, Toggle, toast, useResize,
+  bindMonacoKey, ConfirmDialog, ContextMenu, Field, NamePrompt, TabStrip, TextInput, Toggle, toast, useResize,
   type ConfirmState, type MenuEntry, type NamePromptState,
 } from "../shim/ui.js";
 import { monaco } from "../shim/monaco.js";
@@ -1526,7 +1526,8 @@ function Editor({ value, onChange, onRun, onSelect, revision, height, cols, engi
       const sel = ed.getSelection();
       onSelect(sel && !sel.isEmpty() ? (ed.getModel()?.getValueInRange(sel) ?? "") : "");
     });
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runRef.current());
+    // Run follows its key in Settings > Keybindings (declared below, under the plugin's scope).
+    const unRun = bindMonacoKey(ed, monaco, "plugin:db:run", () => runRef.current());
     // An action of this editor rather than a formatting provider: a provider is registered on
     // Deck's shared Monaco for every SQL model, where it would compete with whatever formats the
     // Editor module's .sql files. Its keybinding is Monaco's own Format Document chord, and it
@@ -1572,7 +1573,7 @@ function Editor({ value, onChange, onRun, onSelect, revision, height, cols, engi
     });
 
     // Modules unmount on navigation; an editor left undisposed leaks its model and its DOM.
-    return () => { provider.dispose(); ed.dispose(); editor.current = null; };
+    return () => { unRun(); provider.dispose(); ed.dispose(); editor.current = null; };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Pull in text set from outside (clicking a table), without disturbing ordinary typing.
@@ -2079,6 +2080,11 @@ Double-click to edit` : text}
     </div>
   );
 }
+
+// Defaults only; a rebinding in Settings > Keybindings wins.
+export const keybindings = () => [
+  { id: "run", title: "Run the query (the selection, if any)", defaultChord: "ctrl+enter" },
+];
 
 /** Called by Deck before a reload re-imports this plugin: the old copy's helper program goes with it. */
 export function dispose() {
