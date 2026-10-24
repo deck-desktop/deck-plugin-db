@@ -8,7 +8,8 @@
 // SHOW CREATE TABLE is not in the editor's read-only allowlist although it only reads.
 import { useEffect, useState } from "react";
 import { Copy, Eye, KeyRound, Link2, RefreshCw, Table2 } from "lucide-react";
-import { Chip, CountChip, tone, toast } from "../shim/ui.js";
+import { Chip, CountChip, tone } from "../shim/ui.js";
+import { notice, failure } from "./notice";
 import {
   isSql, parseDefaults, parseIndexes, structureQueries,
   type EngineId, type ForeignKeyRef, type IndexInfo, type SchemaTable, type Source,
@@ -71,8 +72,8 @@ export function Structure({ source, engine, table, fks, onOpen, onRows }: {
   const fkOf = (col: string) => out.find((f) => f.column === col);
 
   const copy = (text: string) => void navigator.clipboard.writeText(text)
-    .then(() => toast("Copied"))
-    .catch((e) => { console.warn("[db] copy failed", e); toast(`Could not copy: ${String(e)}`); });
+    .then(() => notice("Copied"))
+    .catch((e) => { console.warn("[db] copy failed", e); failure("Could not copy", String(e)); });
 
   return (
     <div className="m-2 mt-1.5 flex min-h-0 flex-1 flex-col overflow-hidden rounded-[10px] border border-subtle bg-card">
