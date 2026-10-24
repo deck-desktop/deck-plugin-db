@@ -24,9 +24,10 @@ import {
 } from "lucide-react";
 import { configRead, configWrite, fsWrite, pickFile, pickSavePath } from "../shim/bridge.js";
 import {
-  bindMonacoKey, ConfirmDialog, ContextMenu, Field, NamePrompt, TabStrip, TextInput, Toggle, toast, useResize,
+  bindMonacoKey, ConfirmDialog, ContextMenu, Field, NamePrompt, TabStrip, TextInput, Toggle, useResize,
   type ConfirmState, type MenuEntry, type NamePromptState,
 } from "../shim/ui.js";
+import { notice, failure } from "./notice";
 import { monaco } from "../shim/monaco.js";
 import {
   appendPage, cell, countFor, deleteStatement, editable, editorLanguage, engineEditBlock, explainFor,
@@ -172,7 +173,7 @@ export default function Database() {
           setBusy(true);
           setError("");
           void installHelper().then(
-            () => { toast("Database drivers installed"); return connect(conn); },
+            () => { notice("Database drivers installed"); return connect(conn); },
             (e) => { setError(String(e)); setBusy(false); },
           );
         },
@@ -721,7 +722,7 @@ function Browser({
         commitTabs(tabsNow().map((t) => (t.id === activeRef.current ? { ...t, name } : t)), activeRef.current, {
           queries: [...queriesRef.current.filter((x) => !(x.connId === conn.id && x.name === name)), q],
         });
-        toast("Saved");
+        notice("Saved");
       },
     });
   };
@@ -810,7 +811,7 @@ function Browser({
     setRunning(Date.now());
     try {
       await source.run(statement, true);
-      toast("Applied");
+      notice("Applied");
       await runText(sql.current);
     } catch (e) {
       setRun(activeRef.current, { error: `${statement}
@@ -1123,7 +1124,7 @@ ${String(e)}` });
  * Format the editor's selection, or all of it when nothing is selected.
  *
  * As an edit rather than setValue, so Ctrl+Z puts the old layout back. SQL the formatter cannot
- * parse is left exactly as it was, with the reason in a toast.
+ * parse is left exactly as it was, with the reason in a notification.
  */
 function formatIn(ed: monaco.editor.IStandaloneCodeEditor, engine: EngineId) {
   const model = ed.getModel();
@@ -1136,7 +1137,7 @@ function formatIn(ed: monaco.editor.IStandaloneCodeEditor, engine: EngineId) {
   try {
     formatted = formatSql(engine, text);
   } catch (e) {
-    toast(`Could not format: ${e instanceof Error ? e.message : String(e)}`);
+    failure("Could not format", e instanceof Error ? e.message : String(e));
     return;
   }
   if (formatted === text) return;
@@ -1595,8 +1596,8 @@ function Editor({ value, onChange, onRun, onSelect, revision, height, cols, engi
 /** Copy text, and say so. A failure is said too: a silent no-op reads as copied. */
 function copyText(text: string, done: string) {
   void navigator.clipboard.writeText(text)
-    .then(() => toast(done))
-    .catch((e) => { console.warn("[db] copy failed", e); toast(`Could not copy: ${String(e)}`); });
+    .then(() => notice(done))
+    .catch((e) => { console.warn("[db] copy failed", e); failure("Could not copy", String(e)); });
 }
 
 /** The text a copied cell gives: what the grid shows, except that NULL is nothing at all. */
@@ -1628,9 +1629,9 @@ function Results({
     if (!path) return;
     try {
       await fsWrite(path, kind === "csv" ? toCsv(r) : toJson(r));
-      toast(`Exported ${r.rows.length.toLocaleString()} rows${r.truncated ? " (the rows on screen)" : ""}`);
+      notice(`Exported ${r.rows.length.toLocaleString()} rows${r.truncated ? " (the rows on screen)" : ""}`);
     } catch (e) {
-      toast(`Could not write the file: ${String(e)}`);
+      failure("Could not write the file", String(e));
     }
   };
 
