@@ -5,5 +5,10 @@
   "icon": "Database",
   "color": "#818cf8",
   "version": "2.1.2",
-  "minDeck": "1.7.0"
+  "minDeck": "1.7.0",
+  "permissions": [
+    "files",
+    "processes",
+    "network"
+  ]
 }
