@@ -4,7 +4,7 @@
   "description": "Browse SQLite files, Postgres, MySQL, SQL Server, Redis and MongoDB, and run queries against them.",
   "icon": "Database",
   "color": "#818cf8",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "minDeck": "1.7.0",
   "permissions": [
     "files",
