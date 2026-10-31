@@ -12,7 +12,7 @@
 // dbDisconnect do, so sources.ts treats both the same.
 import { listen } from "../shim/event.js";
 import {
-  dataDir, exec, fsDelete, fsHash, fsRename, procKill, procStream, procWrite,
+  dataDir, exec, fsDelete, fsHash, fsRename, isWindows, procKill, procStream, procWrite,
   type DbQueryResult, type DbSchema,
 } from "../shim/bridge.js";
 import type { EngineId } from "./db";
@@ -24,6 +24,9 @@ export const HELPER = {
   sha256: "6200f53ec4d2caedbda99f7a46c57505a511b58ff46662cd2a09e19211ffd46c",
   size: "10 MB",
 };
+
+/** Why the helper's engines are not offered: it is a Windows program, with no Linux build yet. */
+const NOT_HERE = "SQL Server, Redis and MongoDB go through a helper program that runs on Windows only, for now";
 
 /** The engines that need the helper. */
 export const usesHelper = (engine: EngineId) => engine === "mssql" || engine === "redis" || engine === "mongo";
@@ -47,6 +50,7 @@ export async function helperInstalled(): Promise<boolean> {
  * the program only once its checksum matches, so a cut-off or altered download is never run.
  */
 export async function installHelper(): Promise<void> {
+  if (!isWindows()) throw new Error(NOT_HERE);
   const exe = await exePath();
   const part = `${exe}.part`;
   const r = await exec("%SystemRoot%\\System32\\curl.exe", [
