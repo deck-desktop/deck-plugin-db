@@ -27,11 +27,17 @@ export const HELPER = {
 };
 
 /**
- * The Linux build of the same version, once it is published beside the Windows one: built by
+ * The Linux build of the same version, published beside the Windows one: built by
  * .github/workflows/bridge-linux.yml on Ubuntu 22.04, the oldest glibc it is to run on, whose log
- * prints the SHA-256 to put here. Until then its engines say they need Windows.
+ * prints the SHA-256 pinned here.
  */
-const HELPER_LINUX: typeof HELPER | null = null;
+const HELPER_LINUX: typeof HELPER | null = {
+  version: "1.0.0",
+  url: "https://github.com/deck-desktop/deck-plugin-db/releases/download/bridge-v1.0.0/deck-db-bridge-linux-x86_64",
+  sha256: "9ef2d1908e9dec2e4ca4f71d6b7d2f1de2c44f37231376e3e14f53a79100d8ff",
+  size: "8 MB",
+  file: "deck-db-bridge",
+};
 
 /** This system's build of the helper, or null when it has none. */
 const asset = () => (isWindows() ? HELPER : HELPER_LINUX);
