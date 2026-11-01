@@ -1,0 +1,41 @@
+# Build deck-db-bridge for Linux and add it to a bridge release beside the Windows .exe.
+#
+# Ubuntu 22.04: native-tls links the system's OpenSSL and glibc, so the binary runs on systems
+# whose glibc is as new as this image's or newer (Debian 12, Ubuntu 22.04 and later). The run's log
+# prints the SHA-256 that src/helper.ts pins as HELPER_LINUX.
+#
+# Started from the Actions tab with the release's tag (bridge-v1.0.0), or by pushing a bridge-v*
+# tag. The release must exist already: the Windows build is made and uploaded by hand.
+name: Bridge for Linux
+
+on:
+  push:
+    tags: ["bridge-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The bridge release to add the Linux build to, e.g. bridge-v1.0.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - run: cargo build --release --manifest-path bridge/Cargo.toml
+      - name: Name, checksum and upload
+        run: |
+          cp bridge/target/release/deck-db-bridge deck-db-bridge-linux-x86_64
+          sha256sum deck-db-bridge-linux-x86_64
+          ls -l deck-db-bridge-linux-x86_64
+          gh release upload "$TAG" deck-db-bridge-linux-x86_64 --clobber

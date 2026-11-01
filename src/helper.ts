@@ -23,22 +23,38 @@ export const HELPER = {
   url: "https://github.com/deck-desktop/deck-plugin-db/releases/download/bridge-v1.0.0/deck-db-bridge.exe",
   sha256: "6200f53ec4d2caedbda99f7a46c57505a511b58ff46662cd2a09e19211ffd46c",
   size: "10 MB",
+  file: "deck-db-bridge.exe",
 };
 
-/** Why the helper's engines are not offered: it is a Windows program, with no Linux build yet. */
-const NOT_HERE = "SQL Server, Redis and MongoDB go through a helper program that runs on Windows only, for now";
+/**
+ * The Linux build of the same version, once it is published beside the Windows one: built by
+ * .github/workflows/bridge-linux.yml on Ubuntu 22.04, the oldest glibc it is to run on, whose log
+ * prints the SHA-256 to put here. Until then its engines say they need Windows.
+ */
+const HELPER_LINUX: typeof HELPER | null = null;
+
+/** This system's build of the helper, or null when it has none. */
+const asset = () => (isWindows() ? HELPER : HELPER_LINUX);
+
+/** Why the helper's engines are not offered here. */
+const NOT_HERE = "SQL Server, Redis and MongoDB go through a helper program that has no build for this system yet";
 
 /** The engines that need the helper. */
 export const usesHelper = (engine: EngineId) => engine === "mssql" || engine === "redis" || engine === "mongo";
 
-const exePath = async () => `${await dataDir()}\\bridge\\${HELPER.version}\\deck-db-bridge.exe`;
+const exePath = async () => {
+  const sep = isWindows() ? "\\" : "/";
+  return [await dataDir(), "bridge", HELPER.version, asset()?.file ?? HELPER.file].join(sep);
+};
 
 /** Set once the file on disk has been checked, so each connect does not hash 10 MB again. */
 let verified = false;
 
 /** Whether this version of the helper is on disk, whole. */
 export async function helperInstalled(): Promise<boolean> {
-  if (!verified) verified = (await fsHash([await exePath()]))[0] === HELPER.sha256;
+  const a = asset();
+  if (!a) return false;
+  if (!verified) verified = (await fsHash([await exePath()]))[0] === a.sha256;
   return verified;
 }
 
@@ -46,28 +62,31 @@ export async function helperInstalled(): Promise<boolean> {
  * Download the helper, check it, and put it in place.
  *
  * Through Windows' own curl (in System32 since Windows 10), named by its full path so another
- * curl earlier on PATH cannot stand in for it. The download goes to a `.part` file and becomes
+ * curl earlier on PATH cannot stand in for it; elsewhere the system's curl. The download goes to a `.part` file and becomes
  * the program only once its checksum matches, so a cut-off or altered download is never run.
  */
 export async function installHelper(): Promise<void> {
-  if (!isWindows()) throw new Error(NOT_HERE);
+  const a = asset();
+  if (!a) throw new Error(NOT_HERE);
   const exe = await exePath();
   const part = `${exe}.part`;
-  const r = await exec("%SystemRoot%\\System32\\curl.exe", [
+  const r = await exec(isWindows() ? "%SystemRoot%\\System32\\curl.exe" : "curl", [
     "-fsSL", "--create-dirs", "--connect-timeout", "20",
     // A download that stalls (under 1 KB/s for 20s) is dropped and retried, not left hanging.
     "--speed-limit", "1024", "--speed-time", "20", "--retry", "3",
-    "-o", part, HELPER.url,
+    "-o", part, a.url,
   ]);
   if (r.code !== 0) throw new Error(`The download failed: ${r.stderr.trim() || `curl exited with ${r.code}`}`);
   const [got] = await fsHash([part]);
-  if (got !== HELPER.sha256) {
+  if (got !== a.sha256) {
     await fsDelete(part).catch(() => {});
-    throw new Error(`The download's SHA-256 is ${got}, not ${HELPER.sha256}, so it was deleted unused.`);
+    throw new Error(`The download's SHA-256 is ${got}, not ${a.sha256}, so it was deleted unused.`);
   }
   // A damaged copy left from before would stop the rename.
   await fsDelete(exe).catch(() => {});
-  await fsRename(part, "deck-db-bridge.exe");
+  await fsRename(part, a.file);
+  // A Linux download keeps no execute bit.
+  if (!isWindows()) await exec("chmod", ["+x", exe]);
   verified = true;
 }
 
