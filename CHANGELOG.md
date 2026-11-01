@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.2.0 (2026-11-01)
+
+- SQL Server, Redis and MongoDB run on Linux, through a Linux build of the same helper
+  (bridge 1.0.0), checked against its pinned SHA-256 before it runs. Needs Deck 1.15.0.
+
 ## 2.1.3 (2026-10-30)
 
 - A licence, this changelog, a README rewritten with a screenshot, and the permissions it uses
